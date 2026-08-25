@@ -650,6 +650,13 @@ https://www.nsmc.org.cn/nsmc/cn/image/wms.html
 
 ## License
 
-No project license has been selected yet.
+The software source code in this repository is licensed under the MIT License.
+See `LICENSE` for details.
 
-If publishing this repository publicly, add a suitable software license and retain the appropriate attribution for NASA and NSMC source data.
+Third-party data and imagery are excluded from the MIT license:
+
+- `nasa_blue_marble_565.h` is derived from NASA Blue Marble imagery.
+  NASA should be acknowledged as the source.
+- NSMC/CMA satellite imagery downloaded by the firmware remains subject to
+  the applicable NSMC/CMA data-use terms and is not redistributed or
+  relicensed by this project.
