@@ -1,3 +1,9 @@
+/*Buy me a coffee!
+Bitcoin: 19H3zFF4W3zUZ3jAdjmiDNNLs8Ja46M6AD
+ETH: 0xD656DB37b61ac30Fa1e16a3162719FE417b231C8
+*/
+
+
 # ESP32-S2 Live Cloud Globe
 
 A standalone **240×240 spinning Earth display with live global cloud imagery**, built around an **Adafruit QtPy ESP32-S2** and a **1.3-inch ST7789 IPS display**.
