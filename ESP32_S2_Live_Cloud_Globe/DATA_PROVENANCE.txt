@@ -1,0 +1,58 @@
+LIVE WEATHER DATA PROVENANCE
+
+Provider:
+  China Meteorological Administration
+  National Satellite Meteorological Center (NSMC)
+
+Official imagery catalogue:
+  GEO Satellite Global Image
+  GEO Global Image (IR 10.8 um)
+
+Official WMS documentation:
+  https://www.nsmc.org.cn/nsmc/cn/image/wms.html
+
+Official documented WMS endpoint:
+  https://data.nsmc.org.cn/NSMCAPI/v1/nsmc/image/wms/compose
+
+Layer:
+  GEOS_IRX
+
+NSMC's documented example for this product uses:
+  layers=GEOS_IRX
+  datetime=<UTC YYYYMMDDHHMM>
+  request=GetMap
+  bbox=<west,south,east,north>
+  width=<pixels>
+  height=<pixels>
+  version=1.1.0
+  format=png
+
+This project requests a global -180,-90,180,90 image at 320x160.
+
+DISPLAY PROCESSING
+------------------
+Real observed image:
+  NSMC GEO global IR 10.8 um composite
+
+Derived locally on ESP:
+  RGB -> luminance
+  adaptive brightness percentile -> display cloud opacity
+  bilinear geographic resampling
+
+The derived opacity is visual styling, not a separate meteorological
+measurement.
+
+No synthetic cloud positions are generated.
+
+
+Availability source
+-------------------
+NSMC official GEOS_IRX available-datetime API:
+https://data.nsmc.org.cn/nsmcapi/v1/nsmc/image/animation/datatime/mongodb
+
+dataCode:
+GEO_MULT_GBAL_L2_GGM_IRX_GLL_YYYYMMDD_HHmm_4000M.PNG
+
+The firmware requests a 168-hour / seven-day availability window and only requests WMS
+images for timestamps returned by this API. A 60-minute live-use safety cutoff
+is still applied.
