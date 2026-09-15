@@ -4,7 +4,7 @@ A standalone 240 × 240 true-colour Earth display based on an **Adafruit QtPy ES
 
 This folder is intentionally the **clean release source**: historical TLS/backend probes, PNG-corruption forensics, heap diagnostics and other investigation-only code have been removed. Operational error logging remains.
 
-<img src="images/cloud_globe.jpg" alt="Cloud Globe" width="500">
+<img src="/cloud_globe.jpg" alt="Cloud Globe" width="500">
 
 ## Hardware
 
