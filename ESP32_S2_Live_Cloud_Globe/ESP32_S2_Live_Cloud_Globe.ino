@@ -6,6 +6,7 @@ ETH: 0xD656DB37b61ac30Fa1e16a3162719FE417b231C8
 #include <Arduino.h>
 #include <new>
 #include <SPI.h>
+#include <Wire.h>
 #include <SD.h>
 #include <stdarg.h>
 #include <WiFi.h>
@@ -14,21 +15,72 @@ ETH: 0xD656DB37b61ac30Fa1e16a3162719FE417b231C8
 #include <time.h>
 #include <esp_heap_caps.h>
 
+// PNGdec 1.1.6 defaults to ((320*4+1)*2)=2562 bytes for its two
+// scanline buffers. DecodePNG() positions the two 1281-byte RGBA+filter rows
+// at offsets 15 and 1311, so bytes through offset 2591 are used: 2592 bytes
+// total. The default therefore overruns into ucFileBuf by 30 bytes at 320px
+// RGBA. build_opt.h supplies -DPNG_MAX_BUFFERED_PIXELS=2624 globally so BOTH
+// this sketch and PNGdec.cpp are compiled with the same corrected layout.
 #include <PNGdec.h>
 #include <Adafruit_GFX.h>
+#include <Adafruit_NeoPixel.h>
 #include <Adafruit_ST7789.h>
+#include <U8g2lib.h>
+#include <AioP13.h>
 
-#include "wifi_config.h"
+static_assert(PNG_MAX_BUFFERED_PIXELS >= 2592,
+              "PNGdec line buffer still 2562: compile the COMPLETE ZIP/folder with build_opt.h present");
+
 #include "ui_types.h"
 #include "globe_screen_map_512x256.h"
 #include "nasa_blue_marble_565.h"
 
 // =============================================================================
-// AUTONOMOUS TRUE-COLOUR EARTH + NSMC GLOBAL GEO IR CLOUDS
+// CLOUD GLOBE V2
+// =============================================================================
+//
+// A standalone 240x240 true-colour Earth display for the Adafruit QtPy
+// ESP32-S2.  The globe combines NASA Blue Marble surface imagery with live
+// global IR cloud observations from CMA/NSMC, local day/night shading and an
+// independently propagated ISS overlay.
+//
+// Design notes:
+//   * Large buffers live in PSRAM so Wi-Fi/mbedTLS retain scarce internal DRAM.
+//   * The ST7789 and microSD use separate SPI buses because this TFT has no CS.
+//   * Weather frames are archived to SD and can be replayed with one button.
+//   * ISS propagation and pass prediction are local; only the TLE is downloaded.
+//   * build_opt.h is REQUIRED.  It increases PNGdec's 320px RGBA scanline
+//     buffer consistently in both this sketch and PNGdec.cpp.
 //
 // Hardware:
 //   Adafruit QtPy ESP32-S2
 //   ZJY-IPS130-V2.0 / ST7789 240x240
+//   SSD1306 128x64 I2C OLED @ 0x3C
+//   microSD breakout
+//   momentary pushbutton (Cherry MX in the finished unit)
+//
+// Wiring used by the finished PCB:
+//   ST7789:  SCK->SCK, MOSI->MO, RST->A0, DC->A1, VCC/BLK->3V, no CS
+//   SSD1306: SDA->SDA, SCL->SCL, VCC->5V, GND->GND
+//   microSD: SCK->A2, MOSI->A3, MISO->RX, CS->TX, VCC->3V
+//   button:   QtPy MI/MISO pad -> switch -> GND (INPUT_PULLUP)
+//
+// Runtime configuration:
+//   /config.ini on microSD stores Wi-Fi, timezone, observer position, visibility
+//   thresholds and feature toggles.  Credentials are never compiled into the
+//   sketch.  See config.ini.example in the release folder.
+//
+// Day/night:
+//   Real AioP13 P13Sun Earth-fixed solar vector.
+//   Geographic per-pixel shading uses the same lat/lon map as Earth/clouds.
+//   Soft twilight and dimmed night hemisphere; historical replay uses its
+//   archived timestamp so the terminator is historically correct.
+//
+// ISS:
+//   CelesTrak GP endpoint, ISS (ZARYA) / NORAD 25544 only
+//   24h successful-refresh limit, 2h failed-attempt retry limit
+//   AioP13 local propagation: true-altitude ISS marker + +/-60 min 3D orbit
+//   Past track solid amber; future track bright dashed cyan
 //
 // Live cloud source:
 //   China Meteorological Administration
@@ -43,6 +95,13 @@ ETH: 0xD656DB37b61ac30Fa1e16a3162719FE417b231C8
 //
 // IR image brightness is used only as a DISPLAY opacity mapping over the
 // cloud-free NASA Blue Marble texture.
+//
+// Button controls:
+//   1 click  = replay previous 24 hours
+//   2 clicks = replay previous 7 days
+//   3 clicks = replay previous 30 days
+//   long     = return to live mode
+//   any physical press also wakes the OLED forecast page immediately.
 // =============================================================================
 
 #define TFT_CS   -1
@@ -53,133 +112,110 @@ Adafruit_ST7789 tft(TFT_CS, TFT_DC, TFT_RST);
 
 
 // =============================================================================
-// Tiny ST7789 boot logger — u8log-like behaviour for startup only
+// SSD1306 boot console — genuine U8G2LOG
+// =============================================================================
+//
+// Hardware:
+//   SSD1306 128x64 OLED
+//   I2C address 0x3C
+//   VCC -> 5V
+//   GND -> GND
+//   SDA -> SDA
+//   SCL -> SCL
+//
+// The OLED serves two roles:
+//   1. genuine U8G2LOG startup console
+//   2. Okubo Heavy Industries-style ISS pass telemetry while the ISS is above
+//      the observer's geometric horizon.
+//
+// Between passes it is cleared and placed into power-save mode.
 // =============================================================================
 
-class TFTLog {
-public:
-  static constexpr uint8_t MAX_LINES = 20;
-  static constexpr uint8_t LINE_CHARS = 36;
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(
+  U8G2_R0,
+  U8X8_PIN_NONE
+);
 
-  TFTLog()
-  : _count(0)
-  {
-    clearLines();
-  }
+constexpr uint8_t U8LOG_WIDTH = 25;
+constexpr uint8_t U8LOG_HEIGHT = 8;
 
-  void begin(const char *title) {
-    clearLines();
+static uint8_t u8logBuffer[
+  U8LOG_WIDTH * U8LOG_HEIGHT
+];
 
-    strncpy(
-      _title,
-      title ? title : "",
-      sizeof(_title) - 1
-    );
+static U8G2LOG bootLog;
 
-    _title[sizeof(_title) - 1] = '\0';
-    redraw();
-  }
+static void beginBootLog() {
+  oled.begin();
 
-  void println(const char *s) {
-    pushLine(s ? s : "");
-    redraw();
-  }
+  // Fixed module address is the standard SSD1306 0x3C.
+  // U8g2's SSD1306 HW-I2C constructor already defaults to this address.
 
-  void printf(const char *fmt, ...) {
-    char buf[LINE_CHARS];
+  oled.setFont(
+    u8g2_font_5x7_tr
+  );
 
-    va_list args;
-    va_start(args, fmt);
+  bootLog.begin(
+    oled,
+    U8LOG_WIDTH,
+    U8LOG_HEIGHT,
+    u8logBuffer
+  );
 
-    vsnprintf(
-      buf,
-      sizeof(buf),
-      fmt,
-      args
-    );
+  bootLog.setLineHeightOffset(0);
 
-    va_end(args);
+  // U8G2LOG mode 0 refreshes on newline.  This is faster and cleaner on a
+  // full-buffer U8g2 display than redrawing for every individual character.
+  bootLog.setRedrawMode(0);
 
-    println(buf);
-  }
+  bootLog.print(
+    "CLOUD GLOBE V2\n"
+  );
+}
 
-private:
-  char _title[32] = {};
-  char _lines[MAX_LINES][LINE_CHARS] = {};
-  uint8_t _count;
+static void bootPrintln(
+  const char *message
+) {
+  if (!message)
+    message = "";
 
-  void clearLines() {
-    _count = 0;
+  Serial.println(message);
 
-    for (uint8_t i = 0; i < MAX_LINES; ++i)
-      _lines[i][0] = '\0';
-  }
+  bootLog.print(message);
+  bootLog.print('\n');
+}
 
-  void pushLine(const char *s) {
-    if (_count < MAX_LINES) {
-      strncpy(
-        _lines[_count],
-        s,
-        LINE_CHARS - 1
-      );
+static void bootPrintf(
+  const char *format,
+  ...
+) {
+  char buffer[48];
 
-      _lines[_count][LINE_CHARS - 1] = '\0';
-      ++_count;
-      return;
-    }
+  va_list args;
+  va_start(args, format);
 
-    for (uint8_t i = 1; i < MAX_LINES; ++i) {
-      memcpy(
-        _lines[i - 1],
-        _lines[i],
-        LINE_CHARS
-      );
-    }
+  vsnprintf(
+    buffer,
+    sizeof(buffer),
+    format,
+    args
+  );
 
-    strncpy(
-      _lines[MAX_LINES - 1],
-      s,
-      LINE_CHARS - 1
-    );
+  va_end(args);
 
-    _lines[MAX_LINES - 1][LINE_CHARS - 1] = '\0';
-  }
+  bootPrintln(buffer);
+}
 
-  void redraw() {
-    tft.fillScreen(ST77XX_BLACK);
+static void finishBootLog() {
+  // Clear U8G2LOG's text window, then clear the physical OLED.
+  bootLog.print("\f\n");
 
-    tft.setTextWrap(false);
-    tft.setTextSize(1);
+  oled.clearBuffer();
+  oled.sendBuffer();
 
-    tft.setTextColor(
-      tft.color565(145, 190, 220)
-    );
-
-    tft.setCursor(6, 6);
-    tft.println(_title);
-
-    tft.drawFastHLine(
-      6,
-      17,
-      228,
-      tft.color565(45, 65, 80)
-    );
-
-    tft.setTextColor(
-      tft.color565(215, 225, 230)
-    );
-
-    int16_t y = 23;
-
-    for (uint8_t i = 0; i < _count; ++i) {
-      tft.setCursor(6, y);
-      tft.print(_lines[i]);
-      y += 10;
-    }
-  }
-};
-
-static TFTLog bootLog;
+  // The OLED will later be woken only when ISS information needs displaying.
+  oled.setPowerSave(1);
+}
 
 // -----------------------------------------------------------------------------
 // Geometry
@@ -216,7 +252,6 @@ static void *pngDecoderMemory = nullptr;
 static uint8_t *decodeTarget = nullptr;
 static uint8_t *decodeTargetAlpha = nullptr;
 static bool decodeError = false;
-static uint32_t decodeOpaquePixels = 0;
 
 // -----------------------------------------------------------------------------
 // Live product / SD archive / replay state
@@ -225,10 +260,8 @@ static uint32_t decodeOpaquePixels = 0;
 static bool haveIRClouds = false;
 static char currentIRTime[13] = ""; // YYYYMMDDHHMM UTC
 
-// The global mosaic can occasionally appear before it is fully settled.
-// Even when NSMC's availability API lists a new dataset, stay one hour behind
-// wall-clock UTC before allowing it to become the live display.
-constexpr uint16_t NSMC_SOURCE_LAG_MINUTES = 60;
+// The official GEOS_IRX availability list is authoritative.
+// Use the newest timestamp as soon as NSMC lists it; no deliberate source lag.
 
 // Ask NSMC for its official GEOS_IRX availability list every 15 minutes.
 // New imagery is currently hourly, while this shorter poll also gives missing
@@ -240,19 +273,19 @@ constexpr uint32_t UPDATE_INTERVAL_MS =
 constexpr uint16_t NSMC_AVAILABILITY_HOURS = 168;
 constexpr uint16_t NSMC_MAX_AVAILABLE_TIMES = 192;
 
-static char nsmcAvailableTimes[NSMC_MAX_AVAILABLE_TIMES][13] = {};
+static char (*nsmcAvailableTimes)[13] = nullptr;
 static uint16_t nsmcAvailableCount = 0;
 
 static uint32_t lastUpdateMillis = 0;
 
 // Active display mapping.
-static uint8_t cloudOpacityLUT[256];
+static uint8_t *cloudOpacityLUT = nullptr;
 static uint8_t globalCloudAlphaScale = 180;
 static bool useAlphaPrimaryOpacity = false;
 
 // Candidate mapping.  Downloads/PNG decode build these without touching the
 // currently displayed weather.  commitCandidate() swaps them in atomically.
-static uint8_t candidateCloudOpacityLUT[256];
+static uint8_t *candidateCloudOpacityLUT = nullptr;
 static uint8_t candidateGlobalCloudAlphaScale = 180;
 static bool candidateUseAlphaPrimaryOpacity = false;
 
@@ -283,6 +316,174 @@ constexpr int BUTTON_PIN = MISO;
 static const char *ARCHIVE_ROOT = "/clouds";
 static const char *ARCHIVE_INDEX = "/clouds/index.csv";
 
+// -----------------------------------------------------------------------------
+// ISS (ZARYA) TLE cache
+// -----------------------------------------------------------------------------
+//
+// CelesTrak etiquette policy:
+//   * request ONE object only: NORAD 25544 / ISS (ZARYA)
+//   * after a successful refresh, do not request again for 24 hours
+//   * if a refresh fails while the cached TLE is stale, wait at least 2 hours
+//     before another attempt
+//   * persist BOTH timestamps on SD so reboots cannot defeat the throttle
+//
+// If SD is unavailable we deliberately do NOT contact CelesTrak, because we
+// could not persist the throttle across a reboot.
+
+static const char *ISS_TLE_URL =
+    "https://celestrak.org/NORAD/elements/gp.php?CATNR=25544&FORMAT=TLE";
+
+static const char *ISS_DIR = "/iss";
+static const char *ISS_TLE_FILE = "/iss/iss.tle";
+static const char *ISS_STATE_FILE = "/iss/fetch_state.txt";
+
+constexpr uint32_t ISS_SUCCESS_INTERVAL_SEC =
+    24UL * 60UL * 60UL;
+
+constexpr uint32_t ISS_RETRY_INTERVAL_SEC =
+    2UL * 60UL * 60UL;
+
+// The local service check is deliberately much more frequent than either
+// network limit; most checks therefore result in zero network traffic.
+constexpr uint32_t ISS_SERVICE_INTERVAL_MS =
+    5UL * 60UL * 1000UL;
+
+static char issTLEName[32] = "";
+static char issTLELine1[80] = "";
+static char issTLELine2[80] = "";
+
+static bool haveISSTLE = false;
+
+static time_t issLastAttemptUTC = 0;
+static time_t issLastSuccessUTC = 0;
+
+static uint32_t lastISSServiceMillis = 0;
+
+// -----------------------------------------------------------------------------
+// ISS local propagation / live globe overlay
+// -----------------------------------------------------------------------------
+//
+// No network traffic is required here.  AioP13 propagates the cached ISS TLE
+// locally.  Current position and the +/-60 minute orbit are refreshed together
+// every 7 seconds and double-buffered
+// so the renderer never reads an array while it is being regenerated.
+
+constexpr float ISS_EARTH_RADIUS_KM = 6378.137f;
+
+// Keep the previous ~45-second sampling density while extending the track
+// from +/-45 minutes to +/-60 minutes:
+//
+//   total span = 120 min = 7200 s
+//   160 intervals -> 45 s per interval
+//   161 stored points
+constexpr uint16_t ISS_ORBIT_POINT_COUNT = 161;
+constexpr uint16_t ISS_ORBIT_NOW_INDEX =
+    (ISS_ORBIT_POINT_COUNT - 1) / 2;
+
+constexpr int32_t ISS_ORBIT_HALF_WINDOW_SEC = 60 * 60;
+constexpr int32_t ISS_ORBIT_STEP_SEC =
+    (ISS_ORBIT_HALF_WINDOW_SEC * 2) /
+    (ISS_ORBIT_POINT_COUNT - 1);
+
+// At this 112 px Earth radius, one screen pixel corresponds to roughly
+// 57 km at the globe surface.  The ISS travels about 7.6 km/s, so ~7 seconds
+// is a good match for approximately one displayed pixel of orbital motion.
+//
+// Position and orbit are deliberately rebuilt on the SAME cadence so the ISS
+// glyph and the past/future split always share essentially the same epoch.
+constexpr uint32_t ISS_POSITION_INTERVAL_MS = 7000;
+constexpr uint32_t ISS_ORBIT_REBUILD_INTERVAL_MS = 7000;
+
+static ISSSpacePoint (*issOrbitBuffers)[ISS_ORBIT_POINT_COUNT] = nullptr;
+static volatile uint8_t issOrbitActiveBuffer = 0;
+static volatile bool issOrbitValid = false;
+
+static volatile bool issPositionValid = false;
+static volatile float issCurrentXER = 0.0f;
+static volatile float issCurrentYER = 0.0f;
+static volatile float issCurrentZER = 0.0f;
+
+// Retain geographic position for the renderer and observer calculations.
+static volatile float issCurrentLatDeg = 0.0f;
+static volatile float issCurrentLonDeg = 0.0f;
+
+static portMUX_TYPE issRenderMux =
+    portMUX_INITIALIZER_UNLOCKED;
+
+static uint32_t lastISSPropagationMillis = 0;
+
+// -----------------------------------------------------------------------------
+// Fixed observer / optical ISS visibility
+// -----------------------------------------------------------------------------
+
+static P13Observer *issObserver = nullptr;
+static P13Sun issVisibilitySun;
+
+static volatile bool issObserverStatusValid = false;
+static volatile bool issAboveHorizon = false;
+static volatile bool issOpticallyVisible = false;
+static volatile bool issSunlit = false;
+
+static volatile float issObserverElevationDeg = 0.0f;
+static volatile float issObserverAzimuthDeg = 0.0f;
+static volatile float issObserverRangeKm = 0.0f;
+static volatile float issObserverSunElevationDeg = 0.0f;
+
+// Predicted geometric horizon set time derived from the already-built future
+// half of the +/-60 minute 3D orbit cache.
+static volatile time_t issPredictedSetUTC = 0;
+
+// Predicted culmination of the CURRENT geometric pass, derived from the
+// existing +/-60 minute 3D orbit cache.  The elevation value is used for the
+// high-quality visible-pass NeoPixel alert; the UTC time drives the live OLED
+// MAX IN countdown.
+static volatile float issCurrentPassMaxElevationDeg = 0.0f;
+static volatile time_t issCurrentPassMaxUTC = 0;
+
+// If the ISS is optically visible during the current pass, cache the next
+// true->false visibility transition.  This lets the live OLED show VIS END
+// after culmination without doing prediction work on every one-second redraw.
+static volatile time_t issCurrentPassVisibleEndUTC = 0;
+
+// Long-range local ISS forecast used by the 15-minute idle OLED screen.
+//
+// NEXT PASS    = next geometric horizon rise (EL crosses 0 degrees upward)
+// NEXT VISIBLE = first future time satisfying the configured optical
+//                visibility test.
+//
+// The scan uses its own AioP13 objects, so it never disturbs the live ISS
+// predictor or the +/-60 minute renderer cache.
+static volatile time_t issNextPassUTC = 0;
+static volatile time_t issNextVisibleUTC = 0;
+
+// Geometric peak elevation of the pass containing NEXT VISIBLE.
+static volatile float issNextVisibleMaxElevationDeg = -1.0f;
+
+static volatile time_t issUpcomingForecastComputedUTC = 0;
+static volatile bool issUpcomingForecastValid = false;
+static volatile bool issUpcomingForecastBusy = false;
+
+static uint32_t lastISSUpcomingForecastServiceMs = 0;
+
+constexpr uint32_t ISS_UPCOMING_FORECAST_SERVICE_MS =
+    60UL * 1000UL;
+
+// Scan far enough to survive gaps between naked-eye visibility seasons.
+// One-minute coarse samples are refined to a few seconds at the first
+// false->true transition.
+constexpr int32_t ISS_UPCOMING_FORECAST_STEP_SEC = 60;
+constexpr int32_t ISS_UPCOMING_FORECAST_MAX_SEC =
+    14L * 24L * 60L * 60L;
+
+static bool lastLoggedObserverValid = false;
+static bool lastLoggedAboveHorizon = false;
+static bool lastLoggedVisible = false;
+static bool lastLoggedSunlit = false;
+static uint32_t lastObserverStatusLogMs = 0;
+
+constexpr double SUN_RADIUS_KM = 696340.0;
+constexpr double SUN_MEAN_DISTANCE_KM = 149597870.7;
+
 // No guessed 15-minute backfill is used anymore.  The official NSMC
 // availability list is the source of truth for which timestamps should exist.
 
@@ -300,9 +501,27 @@ static volatile bool backfillActive = false;
 static volatile uint16_t backfillDone = 0;
 static volatile uint16_t backfillTotal = 0;
 
+// Gap repair is intentionally incremental.  A pass walks the official NSMC
+// availability list newest-first, but downloads at most ONE missing frame each
+// time the weather worker comes around.  This prevents a large archive backlog
+// from starving higher-priority ISS forecast work.
+static bool gapRepairPassPending = false;
+static int16_t gapRepairCursor = -1;
+static uint16_t gapRepairSaved = 0;
+static uint16_t gapRepairFailed = 0;
+
 // Current HTTP body progress.  Used only for the small on-screen NET indicator.
 static volatile uint32_t httpBodyBytes = 0;
 static volatile int32_t httpBodyExpected = -1;
+
+// Last NSMC transport-layer result. Negative HTTPClient codes mean the request
+// never reached a normal HTTP response (DNS/TCP/TLS/connect path).
+static int lastNSMCTransportCode = 0;
+
+// configTime() starts the ESP32 SNTP client asynchronously. Keep it running
+// instead of restarting it every time a short synchronous wait expires.
+static bool ntpClientStarted = false;
+static bool ntpTimeConfirmed = false;
 
 // -----------------------------------------------------------------------------
 // Replay state
@@ -350,6 +569,14 @@ static portMUX_TYPE buttonCommandMux =
 static volatile uint8_t pendingButtonEvent =
     (uint8_t)ButtonEvent::None;
 
+// Separate one-bit mailbox for the SSD1306 forecast page.
+//
+// This is deliberately triggered by the PHYSICAL debounced press rather than
+// by the later Single/Double/Triple/LongPress gesture.  Therefore the OLED
+// responds immediately while the cloud-playback gesture is still being built.
+static volatile bool pendingISSOLEDManualForecast =
+    false;
+
 // Immediate visual acknowledgement while a click sequence is being assembled.
 // 0 = no pending sequence; 1/2/3 = number of accepted short presses so far.
 static volatile uint8_t buttonPreviewClicks = 0;
@@ -385,6 +612,28 @@ static void *allocPSRAMPreferred(size_t bytes) {
 }
 
 static bool allocateRuntimeMemory() {
+  // Preserve scarce internal DRAM for Wi-Fi/mbedTLS.  These retained tables
+  // do not need DMA/internal memory and are ideal PSRAM residents.
+  nsmcAvailableTimes =
+      (char (*)[13])allocPSRAMPreferred(
+        NSMC_MAX_AVAILABLE_TIMES * 13UL
+      );
+
+  issOrbitBuffers =
+      (ISSSpacePoint (*)[ISS_ORBIT_POINT_COUNT])allocPSRAMPreferred(
+        2UL * ISS_ORBIT_POINT_COUNT * sizeof(ISSSpacePoint)
+      );
+
+  cloudOpacityLUT =
+      (uint8_t *)allocPSRAMPreferred(
+        256
+      );
+
+  candidateCloudOpacityLUT =
+      (uint8_t *)allocPSRAMPreferred(
+        256
+      );
+
   irLuma =
       (uint8_t *)allocPSRAMPreferred(
         IR_PIXELS
@@ -411,6 +660,10 @@ static bool allocateRuntimeMemory() {
       );
 
   if (
+    !nsmcAvailableTimes ||
+    !issOrbitBuffers ||
+    !cloudOpacityLUT ||
+    !candidateCloudOpacityLUT ||
     !irLuma ||
     !candidateLuma ||
     !irAlpha ||
@@ -424,16 +677,25 @@ static bool allocateRuntimeMemory() {
     return false;
   }
 
+  memset(
+    nsmcAvailableTimes,
+    0,
+    NSMC_MAX_AVAILABLE_TIMES * 13UL
+  );
+
+  memset(
+    issOrbitBuffers,
+    0,
+    2UL * ISS_ORBIT_POINT_COUNT * sizeof(ISSSpacePoint)
+  );
+
+  memset(cloudOpacityLUT, 0, 256);
+  memset(candidateCloudOpacityLUT, 0, 256);
+
   memset(irLuma, 0, IR_PIXELS);
   memset(candidateLuma, 0, IR_PIXELS);
   memset(irAlpha, 0, IR_PIXELS);
   memset(candidateAlpha, 0, IR_PIXELS);
-
-  Serial.printf(
-    "[MEM] IR luma+alpha buffers=%lu bytes, download=%u bytes\n",
-    (unsigned long)(IR_PIXELS * 4UL),
-    (unsigned)DOWNLOAD_BUFFER_CAPACITY
-  );
 
   return true;
 }
@@ -445,10 +707,22 @@ static bool ensurePNGDecoder() {
   const size_t bytes =
       sizeof(PNG);
 
+  // Prefer internal RAM after the HTTP object has released its TLS buffers.
+  // PSRAM is a safe fallback; build_opt.h fixes the unrelated PNGdec scanline
+  // buffer issue that previously corrupted 320x160 RGBA source images.
   pngDecoderMemory =
-      allocPSRAMPreferred(
-        bytes
+      heap_caps_malloc(
+        bytes,
+        MALLOC_CAP_INTERNAL |
+        MALLOC_CAP_8BIT
       );
+
+  if (!pngDecoderMemory) {
+    pngDecoderMemory =
+        allocPSRAMPreferred(
+          bytes
+        );
+  }
 
   if (!pngDecoderMemory) {
     Serial.printf(
@@ -462,12 +736,19 @@ static bool ensurePNGDecoder() {
   pngDecoder =
       new (pngDecoderMemory) PNG();
 
-  Serial.printf(
-    "[PNG] Decoder allocated: %u bytes\n",
-    (unsigned)bytes
-  );
-
   return true;
+}
+
+static void releasePNGDecoder() {
+  if (pngDecoder) {
+    pngDecoder->~PNG();
+    pngDecoder = nullptr;
+  }
+
+  if (pngDecoderMemory) {
+    free(pngDecoderMemory);
+    pngDecoderMemory = nullptr;
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -581,8 +862,2120 @@ static bool hasPNGIEND(
 }
 
 // -----------------------------------------------------------------------------
+// SD-card runtime configuration
+// -----------------------------------------------------------------------------
+
+static const char *RUNTIME_CONFIG_FILE =
+    "/config.ini";
+
+// Runtime configuration lives directly in the sketch so replacing only the
+// .ino in an existing Arduino project does not require a matching new header.
+struct AppRuntimeConfig {
+  char wifiSSID[65];
+  char wifiPassword[65];
+
+  int16_t utcOffsetMinutes;
+  char timezoneLabel[12];
+
+  bool enableISS;
+  bool enableClouds;
+  bool enableDayNight;
+
+  // Fixed observer position used for ISS azimuth/elevation and visibility.
+  // Latitude: north positive, south negative.
+  // Longitude: east positive, west negative.
+  // Altitude: metres above sea level.
+  double observerLatDeg;
+  double observerLonDeg;
+  double observerAltM;
+  bool observerConfigured;
+
+  // Practical visibility thresholds.
+  double visibleMinElevationDeg;
+  double visibleSunMaxElevationDeg;
+};
+
+static AppRuntimeConfig appConfig;
+
+// -----------------------------------------------------------------------------
+// Onboard QtPy NeoPixel — ISS observer status
+// -----------------------------------------------------------------------------
+//
+// Plain uint8_t state constants are used deliberately. Arduino auto-generates
+// function prototypes before much of the .ino is compiled; built-in types keep
+// those generated prototypes independent of declaration order.
+//
+// OFF             = ISS below horizon / observer unavailable
+// BLUE solid      = above horizon, eclipsed
+// PURPLE solid    = above horizon, sunlit, not optically visible
+// GREEN flashing  = optically visible
+
+constexpr uint8_t ISS_NEO_STATE_OFF = 0;
+constexpr uint8_t ISS_NEO_STATE_ABOVE_ECLIPSED = 1;
+constexpr uint8_t ISS_NEO_STATE_ABOVE_SUNLIT_NOT_VISIBLE = 2;
+constexpr uint8_t ISS_NEO_STATE_VISIBLE = 3;
+
+static uint8_t lastISSNeoPixelState =
+    ISS_NEO_STATE_OFF;
+
+static bool lastISSNeoPixelFlashOn = false;
+static bool lastISSNeoPixelGreatPass = false;
+
+constexpr uint32_t ISS_VISIBLE_FLASH_HALF_PERIOD_MS = 700;
+
+// "Really great" visible pass: geometric maximum elevation >= 60 degrees.
+// 233 ms is approximately 3x the normal 700 ms half-period.
+constexpr float ISS_GREAT_PASS_MIN_MAX_EL_DEG = 60.0f;
+constexpr uint32_t ISS_VISIBLE_GREAT_FLASH_HALF_PERIOD_MS = 233;
+
+constexpr uint8_t ISS_NEO_BLUE_B = 56;
+constexpr uint8_t ISS_NEO_PURPLE_R = 48;
+constexpr uint8_t ISS_NEO_PURPLE_B = 58;
+constexpr uint8_t ISS_NEO_GREEN_G = 72;
+
+#if defined(PIN_NEOPIXEL)
+static Adafruit_NeoPixel issNeoPixel(
+  1,
+  PIN_NEOPIXEL,
+  NEO_GRB + NEO_KHZ800
+);
+#endif
+
+static void writeISSNeoPixel(
+  uint8_t r,
+  uint8_t g,
+  uint8_t b
+) {
+#if defined(PIN_NEOPIXEL)
+  issNeoPixel.setPixelColor(
+    0,
+    issNeoPixel.Color(
+      r,
+      g,
+      b
+    )
+  );
+  issNeoPixel.show();
+#else
+  (void)r;
+  (void)g;
+  (void)b;
+#endif
+}
+
+static void beginISSNeoPixel() {
+#if defined(NEOPIXEL_POWER)
+  pinMode(
+    NEOPIXEL_POWER,
+    OUTPUT
+  );
+
+#if defined(NEOPIXEL_POWER_ON)
+  digitalWrite(
+    NEOPIXEL_POWER,
+    NEOPIXEL_POWER_ON
+  );
+#else
+  digitalWrite(
+    NEOPIXEL_POWER,
+    HIGH
+  );
+#endif
+#endif
+
+#if defined(PIN_NEOPIXEL)
+  issNeoPixel.begin();
+  issNeoPixel.setBrightness(
+    255
+  );
+  issNeoPixel.clear();
+  issNeoPixel.show();
+#endif
+}
+
+static uint8_t determineISSNeoPixelState() {
+  if (
+    !appConfig.enableISS ||
+    !appConfig.observerConfigured
+  ) {
+    return
+        ISS_NEO_STATE_OFF;
+  }
+
+  bool statusValid = false;
+  bool above = false;
+  bool visible = false;
+  bool sunlit = false;
+
+  portENTER_CRITICAL(
+    &issRenderMux
+  );
+
+  statusValid =
+      issObserverStatusValid;
+
+  above =
+      issAboveHorizon;
+
+  visible =
+      issOpticallyVisible;
+
+  sunlit =
+      issSunlit;
+
+  portEXIT_CRITICAL(
+    &issRenderMux
+  );
+
+  if (
+    !statusValid ||
+    !above
+  ) {
+    return
+        ISS_NEO_STATE_OFF;
+  }
+
+  if (visible) {
+    return
+        ISS_NEO_STATE_VISIBLE;
+  }
+
+  if (sunlit) {
+    return
+        ISS_NEO_STATE_ABOVE_SUNLIT_NOT_VISIBLE;
+  }
+
+  return
+      ISS_NEO_STATE_ABOVE_ECLIPSED;
+}
+
+static const char *issNeoPixelStateName(
+  uint8_t state
+) {
+  switch (state) {
+    case ISS_NEO_STATE_ABOVE_ECLIPSED:
+      return "BLUE / ABOVE ECLIPSED";
+
+    case ISS_NEO_STATE_ABOVE_SUNLIT_NOT_VISIBLE:
+      return "PURPLE / ABOVE SUNLIT";
+
+    case ISS_NEO_STATE_VISIBLE:
+      return "GREEN FLASH / VISIBLE";
+
+    case ISS_NEO_STATE_OFF:
+    default:
+      return "OFF";
+  }
+}
+
+static void serviceISSNeoPixel() {
+  const uint8_t state =
+      determineISSNeoPixelState();
+
+  const uint32_t nowMs =
+      millis();
+
+  float currentPassMaxEl = 0.0f;
+
+  portENTER_CRITICAL(
+    &issRenderMux
+  );
+
+  currentPassMaxEl =
+      issCurrentPassMaxElevationDeg;
+
+  portEXIT_CRITICAL(
+    &issRenderMux
+  );
+
+  const bool greatPass =
+      state ==
+        ISS_NEO_STATE_VISIBLE &&
+      currentPassMaxEl >=
+        ISS_GREAT_PASS_MIN_MAX_EL_DEG;
+
+  const uint32_t visibleFlashHalfPeriodMs =
+      greatPass ?
+      ISS_VISIBLE_GREAT_FLASH_HALF_PERIOD_MS :
+      ISS_VISIBLE_FLASH_HALF_PERIOD_MS;
+
+  bool flashOn = true;
+
+  if (
+    state ==
+    ISS_NEO_STATE_VISIBLE
+  ) {
+    flashOn =
+        (
+          nowMs /
+          visibleFlashHalfPeriodMs
+        ) &
+        1u;
+  }
+
+  const bool stateChanged =
+      state !=
+      lastISSNeoPixelState;
+
+  const bool flashChanged =
+      state ==
+        ISS_NEO_STATE_VISIBLE &&
+      flashOn !=
+        lastISSNeoPixelFlashOn;
+
+  const bool greatPassChanged =
+      state ==
+        ISS_NEO_STATE_VISIBLE &&
+      greatPass !=
+        lastISSNeoPixelGreatPass;
+
+  if (
+    !stateChanged &&
+    !flashChanged &&
+    !greatPassChanged
+  ) {
+    return;
+  }
+
+  lastISSNeoPixelState =
+      state;
+
+  lastISSNeoPixelFlashOn =
+      flashOn;
+
+  lastISSNeoPixelGreatPass =
+      greatPass;
+
+  if (
+    stateChanged ||
+    greatPassChanged
+  ) {
+    if (
+      state ==
+        ISS_NEO_STATE_VISIBLE
+    ) {
+      Serial.printf(
+        "[ISS NEO] %s MAXEL=%.1f FLASH=%lums\n",
+        greatPass ?
+          "GREEN FAST / GREAT VISIBLE" :
+          "GREEN / VISIBLE",
+        (double)currentPassMaxEl,
+        (unsigned long)visibleFlashHalfPeriodMs
+      );
+    }
+    else if (stateChanged) {
+      Serial.printf(
+        "[ISS NEO] %s\n",
+        issNeoPixelStateName(
+          state
+        )
+      );
+    }
+  }
+
+  switch (state) {
+    case ISS_NEO_STATE_ABOVE_ECLIPSED:
+      writeISSNeoPixel(
+        0,
+        0,
+        ISS_NEO_BLUE_B
+      );
+      break;
+
+    case ISS_NEO_STATE_ABOVE_SUNLIT_NOT_VISIBLE:
+      writeISSNeoPixel(
+        ISS_NEO_PURPLE_R,
+        0,
+        ISS_NEO_PURPLE_B
+      );
+      break;
+
+    case ISS_NEO_STATE_VISIBLE:
+      if (flashOn) {
+        writeISSNeoPixel(
+          0,
+          ISS_NEO_GREEN_G,
+          0
+        );
+      }
+      else {
+        writeISSNeoPixel(
+          0,
+          0,
+          0
+        );
+      }
+      break;
+
+    case ISS_NEO_STATE_OFF:
+    default:
+      writeISSNeoPixel(
+        0,
+        0,
+        0
+      );
+      break;
+  }
+}
+
+
+// -----------------------------------------------------------------------------
+// SSD1306 ISS pass screen 
+// -----------------------------------------------------------------------------
+//
+// 
+//   128x64 outer frame
+//   horizontal rules y=9, 27, 54
+//   u8g2_font_u8glib_4_tr
+//   compact telemetry
+//   outlined/inverted status boxes
+//   
+//
+// The OLED wakes at the geometric horizon (EL > 0), not the configurable
+// visible-elevation threshold. This allows it to show the whole pass.
+
+constexpr uint32_t ISS_OLED_REFRESH_MS = 1000;
+
+// When the ISS is below the horizon, wake the OLED on local wall-clock quarter
+// hours (:00, :15, :30, :45) and leave the forecast page visible for 30 seconds.
+constexpr uint32_t ISS_OLED_FORECAST_INTERVAL_MS =
+    15UL * 60UL * 1000UL;
+
+constexpr uint32_t ISS_OLED_FORECAST_DURATION_MS =
+    30UL * 1000UL;
+
+constexpr uint8_t ISS_OLED_MODE_SLEEP = 0;
+constexpr uint8_t ISS_OLED_MODE_PASS = 1;
+constexpr uint8_t ISS_OLED_MODE_FORECAST = 2;
+
+static bool issOLEDActive = false;
+static uint8_t issOLEDMode =
+    ISS_OLED_MODE_SLEEP;
+
+static uint32_t lastISSOLEDRefreshMs = 0;
+
+// Forecast page timing is aligned to local wall-clock quarter hours:
+//
+//   hh:00
+//   hh:15
+//   hh:30
+//   hh:45
+//
+// Slot number is derived from configured local time rather than millis().
+// Forecast start is additionally restricted to the first 30 seconds of a real
+// quarter-hour, so NTP/time-sync corrections cannot masquerade as boundaries.
+static bool issOLEDForecastClockInitialised = false;
+static int64_t issOLEDForecastLastQuarterSlot = -1;
+
+static uint32_t issOLEDForecastUntilMs = 0;
+
+// Explicit button-triggered forecast window.  This is separate from the
+// quarter-hour window so a button press can happen at any time and always gets
+// a full 30 seconds from the most recent physical press.
+static uint32_t issOLEDManualForecastUntilMs = 0;
+
+// Tiny 8x8 ISS-ish glyph: body + solar-panel silhouette.
+static const uint8_t PROGMEM ISS_OLED_GLYPH[] = {
+  0x24,
+  0x7E,
+  0x3C,
+  0xFF,
+  0xFF,
+  0x3C,
+  0x7E,
+  0x24
+};
+
+static void drawOHIStatusBox(
+  uint8_t x,
+  uint8_t y,
+  uint8_t w,
+  const char *label,
+  bool active
+) {
+  constexpr uint8_t h = 11;
+
+  if (active) {
+    oled.setDrawColor(1);
+
+    oled.drawBox(
+      x,
+      y,
+      w,
+      h
+    );
+
+    oled.setDrawColor(0);
+  }
+  else {
+    oled.setDrawColor(1);
+
+    oled.drawFrame(
+      x,
+      y,
+      w,
+      h
+    );
+  }
+
+  const uint8_t textWidth =
+      oled.getStrWidth(
+        label
+      );
+
+  const uint8_t textX =
+      x +
+      (
+        w >
+          textWidth ?
+        (
+          w -
+          textWidth
+        ) /
+        2 :
+        1
+      );
+
+  oled.drawStr(
+    textX,
+    y + 8,
+    label
+  );
+
+  oled.setDrawColor(1);
+}
+
+// U8g2's compact u8glib font does not reliably expose a UTF-8 degree glyph.
+// Draw the telemetry text normally and add a tiny vector degree mark so the
+// symbol is guaranteed to appear on every SSD1306 build.
+static void drawISSOLEDTextWithDegree(
+  int16_t x,
+  int16_t baselineY,
+  const char *text
+) {
+  if (!text)
+    return;
+
+  oled.drawStr(
+    x,
+    baselineY,
+    text
+  );
+
+  const int16_t degreeX =
+      x +
+      (int16_t)oled.getStrWidth(
+        text
+      ) +
+      2;
+
+  oled.drawCircle(
+    degreeX,
+    baselineY - 5,
+    1,
+    U8G2_DRAW_ALL
+  );
+}
+
+static void formatISSOLEDLocalTime(
+  time_t utc,
+  char *out,
+  size_t outSize
+) {
+  if (
+    !out ||
+    outSize == 0 ||
+    utc < 1700000000
+  ) {
+    if (
+      out &&
+      outSize > 0
+    ) {
+      strlcpy(
+        out,
+        "--:--",
+        outSize
+      );
+    }
+
+    return;
+  }
+
+  const time_t localTime =
+      utc +
+      (time_t)
+      appConfig.utcOffsetMinutes *
+      60;
+
+  struct tm t = {};
+
+  if (
+    !gmtime_r(
+      &localTime,
+      &t
+    )
+  ) {
+    strlcpy(
+      out,
+      "--:--",
+      outSize
+    );
+
+    return;
+  }
+
+  snprintf(
+    out,
+    outSize,
+    "%02d:%02d",
+    t.tm_hour,
+    t.tm_min
+  );
+}
+
+static void formatISSOLEDLocalDateTime(
+  time_t utc,
+  char *out,
+  size_t outSize
+) {
+  if (
+    !out ||
+    outSize == 0
+  ) {
+    return;
+  }
+
+  if (utc < 1700000000) {
+    strlcpy(
+      out,
+      "-- --- --:--",
+      outSize
+    );
+
+    return;
+  }
+
+  const time_t localTime =
+      utc +
+      (time_t)
+      appConfig.utcOffsetMinutes *
+      60;
+
+  struct tm t = {};
+
+  if (
+    !gmtime_r(
+      &localTime,
+      &t
+    )
+  ) {
+    strlcpy(
+      out,
+      "-- --- --:--",
+      outSize
+    );
+
+    return;
+  }
+
+  static const char *MONTHS[12] = {
+    "JAN", "FEB", "MAR", "APR",
+    "MAY", "JUN", "JUL", "AUG",
+    "SEP", "OCT", "NOV", "DEC"
+  };
+
+  snprintf(
+    out,
+    outSize,
+    "%02d %s %02d:%02d",
+    t.tm_mday,
+    MONTHS[
+      t.tm_mon
+    ],
+    t.tm_hour,
+    t.tm_min
+  );
+}
+
+
+static void sleepISSOLED() {
+  if (!issOLEDActive)
+    return;
+
+  oled.clearBuffer();
+  oled.sendBuffer();
+  oled.setPowerSave(1);
+
+  issOLEDActive = false;
+  issOLEDMode =
+      ISS_OLED_MODE_SLEEP;
+
+  Serial.println(
+    "[ISS OLED] Sleep"
+  );
+}
+
+static void drawISSOLEDScreen() {
+  bool statusValid = false;
+  bool above = false;
+  bool sunlit = false;
+  bool visible = false;
+
+  float elevation = 0.0f;
+  float azimuth = 0.0f;
+  float rangeKm = 0.0f;
+  float sunElevation = 0.0f;
+
+  time_t predictedSetUTC = 0;
+  time_t predictedMaxUTC = 0;
+  time_t predictedVisibleEndUTC = 0;
+
+  portENTER_CRITICAL(
+    &issRenderMux
+  );
+
+  statusValid =
+      issObserverStatusValid;
+
+  above =
+      issAboveHorizon;
+
+  sunlit =
+      issSunlit;
+
+  visible =
+      issOpticallyVisible;
+
+  elevation =
+      issObserverElevationDeg;
+
+  azimuth =
+      issObserverAzimuthDeg;
+
+  rangeKm =
+      issObserverRangeKm;
+
+  sunElevation =
+      issObserverSunElevationDeg;
+
+  predictedSetUTC =
+      issPredictedSetUTC;
+
+  predictedMaxUTC =
+      issCurrentPassMaxUTC;
+
+  predictedVisibleEndUTC =
+      issCurrentPassVisibleEndUTC;
+
+  portEXIT_CRITICAL(
+    &issRenderMux
+  );
+
+  if (
+    !statusValid ||
+    !above
+  ) {
+    sleepISSOLED();
+    return;
+  }
+
+  if (
+    !issOLEDActive ||
+    issOLEDMode !=
+      ISS_OLED_MODE_PASS
+  ) {
+    oled.setPowerSave(0);
+    issOLEDActive = true;
+    issOLEDMode =
+        ISS_OLED_MODE_PASS;
+
+    Serial.println(
+      "[ISS OLED] Wake PASS"
+    );
+  }
+
+  oled.clearBuffer();
+
+  oled.setFontMode(1);
+  oled.setDrawColor(1);
+  oled.setFont(
+    u8g2_font_u8glib_4_tr
+  );
+
+  // OHI frame and horizontal architecture.
+  oled.drawFrame(
+    0,
+    0,
+    128,
+    64
+  );
+
+  oled.drawHLine(
+    0,
+    9,
+    128
+  );
+
+  oled.drawHLine(
+    0,
+    27,
+    128
+  );
+
+  oled.drawHLine(
+    0,
+    54,
+    128
+  );
+
+  // Header.
+  oled.drawXBMP(
+    3,
+    1,
+    8,
+    8,
+    ISS_OLED_GLYPH
+  );
+
+  oled.drawStr(
+    14,
+    7,
+    "ISS PASS"
+  );
+
+  char currentTime[8];
+
+  formatISSOLEDLocalTime(
+    time(nullptr),
+    currentTime,
+    sizeof(currentTime)
+  );
+
+  const uint8_t timeWidth =
+      oled.getStrWidth(
+        currentTime
+      );
+
+  oled.drawStr(
+    124 -
+      timeWidth,
+    7,
+    currentTime
+  );
+
+  // Primary telemetry.
+  char leftLine[24];
+  char rightLine[24];
+
+  snprintf(
+    leftLine,
+    sizeof(leftLine),
+    "EL:%+5.1f",
+    (double)elevation
+  );
+
+  snprintf(
+    rightLine,
+    sizeof(rightLine),
+    "AZ:%5.1f",
+    (double)azimuth
+  );
+
+  drawISSOLEDTextWithDegree(
+    4,
+    17,
+    leftLine
+  );
+
+  drawISSOLEDTextWithDegree(
+    70,
+    17,
+    rightLine
+  );
+
+  snprintf(
+    leftLine,
+    sizeof(leftLine),
+    "RNG:%4.0f km",
+    (double)rangeKm
+  );
+
+  char setText[8];
+
+  formatISSOLEDLocalTime(
+    predictedSetUTC,
+    setText,
+    sizeof(setText)
+  );
+
+  snprintf(
+    rightLine,
+    sizeof(rightLine),
+    "SET:%s",
+    setText
+  );
+
+  oled.drawStr(
+    4,
+    25,
+    leftLine
+  );
+
+  oled.drawStr(
+    70,
+    25,
+    rightLine
+  );
+
+  // Three familiar OHI-style state boxes.
+  drawOHIStatusBox(
+    3,
+    31,
+    34,
+    "ABOVE",
+    above
+  );
+
+  drawOHIStatusBox(
+    40,
+    31,
+    38,
+    "SUNLIT",
+    sunlit
+  );
+
+  drawOHIStatusBox(
+    81,
+    31,
+    43,
+    "VISIBLE",
+    visible
+  );
+
+  // Local observing conditions plus one phase-aware current-pass countdown.
+  snprintf(
+    leftLine,
+    sizeof(leftLine),
+    "SUN:%+5.1f",
+    (double)sunElevation
+  );
+
+  drawISSOLEDTextWithDegree(
+    4,
+    51,
+    leftLine
+  );
+
+  const time_t nowUTC =
+      time(nullptr);
+
+  long remainingSec = 0;
+
+  if (
+    predictedMaxUTC >
+      nowUTC
+  ) {
+    remainingSec =
+        (long)(
+          predictedMaxUTC -
+          nowUTC
+        );
+
+    snprintf(
+      rightLine,
+      sizeof(rightLine),
+      "MAX IN %ld s",
+      remainingSec
+    );
+  }
+  else if (
+    visible &&
+    predictedVisibleEndUTC >
+      nowUTC
+  ) {
+    remainingSec =
+        (long)(
+          predictedVisibleEndUTC -
+          nowUTC
+        );
+
+    snprintf(
+      rightLine,
+      sizeof(rightLine),
+      "VIS END %ld s",
+      remainingSec
+    );
+  }
+  else if (
+    predictedSetUTC >
+      nowUTC
+  ) {
+    remainingSec =
+        (long)(
+          predictedSetUTC -
+          nowUTC
+        );
+
+    snprintf(
+      rightLine,
+      sizeof(rightLine),
+      "PASS END %ld s",
+      remainingSec
+    );
+  }
+  else {
+    strlcpy(
+      rightLine,
+      "PASS END -- s",
+      sizeof(rightLine)
+    );
+  }
+
+  // Right-align the variable-length countdown so the final unit stays fixed.
+  const uint8_t countdownWidth =
+      oled.getStrWidth(
+        rightLine
+      );
+
+  oled.drawStr(
+    124 -
+      countdownWidth,
+    51,
+    rightLine
+  );
+
+  // House footer.
+  const char *footer =
+      "OKUBO HEAVY INDUSTRIES";
+
+  // OHI house footer: deliberately left-justified, close to but clear of the
+  // outer frame.
+  oled.drawStr(
+    4,
+    62,
+    footer
+  );
+
+  oled.sendBuffer();
+}
+
+static void drawISSForecastOLEDScreen() {
+  // Final semantic guard: never knowingly put a past event under a NEXT label.
+  //
+  // Normally serviceISSUpcomingForecast() has already retired it. This catches
+  // the narrow race where a quarter-hour OLED wake occurs before the next
+  // one-minute background forecast service.
+  const time_t displayNowUTC =
+      time(nullptr);
+
+  bool needsImmediateForecastRefresh = false;
+
+  if (
+    displayNowUTC >= 1700000000 &&
+    !issUpcomingForecastBusy
+  ) {
+    time_t cachedPassUTC = 0;
+    time_t cachedVisibleUTC = 0;
+    bool cachedValid = false;
+
+    portENTER_CRITICAL(
+      &issRenderMux
+    );
+
+    cachedValid =
+        issUpcomingForecastValid;
+
+    cachedPassUTC =
+        issNextPassUTC;
+
+    cachedVisibleUTC =
+        issNextVisibleUTC;
+
+    portEXIT_CRITICAL(
+      &issRenderMux
+    );
+
+    if (
+      cachedValid &&
+      (
+        (
+          cachedPassUTC != 0 &&
+          cachedPassUTC <=
+            displayNowUTC
+        ) ||
+        (
+          cachedVisibleUTC != 0 &&
+          cachedVisibleUTC <=
+            displayNowUTC
+        )
+      )
+    ) {
+      needsImmediateForecastRefresh =
+          true;
+    }
+  }
+
+  if (needsImmediateForecastRefresh) {
+    Serial.println(
+      "[ISS FORECAST] OLED found stale NEXT event; refreshing"
+    );
+
+    refreshISSUpcomingForecast();
+  }
+
+  bool forecastValid = false;
+  bool forecastBusy = false;
+
+  time_t nextPassUTC = 0;
+  time_t nextVisibleUTC = 0;
+  float nextVisibleMaxEl = -1.0f;
+
+  portENTER_CRITICAL(
+    &issRenderMux
+  );
+
+  forecastValid =
+      issUpcomingForecastValid;
+
+  forecastBusy =
+      issUpcomingForecastBusy;
+
+  nextPassUTC =
+      issNextPassUTC;
+
+  nextVisibleUTC =
+      issNextVisibleUTC;
+
+  nextVisibleMaxEl =
+      issNextVisibleMaxElevationDeg;
+
+  portEXIT_CRITICAL(
+    &issRenderMux
+  );
+
+  if (
+    !issOLEDActive ||
+    issOLEDMode !=
+      ISS_OLED_MODE_FORECAST
+  ) {
+    oled.setPowerSave(0);
+    issOLEDActive = true;
+    issOLEDMode =
+        ISS_OLED_MODE_FORECAST;
+
+    Serial.println(
+      "[ISS OLED] Wake FORECAST"
+    );
+  }
+
+  oled.clearBuffer();
+  oled.setFontMode(1);
+  oled.setDrawColor(1);
+  oled.setFont(
+    u8g2_font_u8glib_4_tr
+  );
+
+  // OHI house frame.
+  oled.drawFrame(
+    0,
+    0,
+    128,
+    64
+  );
+
+  oled.drawHLine(
+    0,
+    9,
+    128
+  );
+
+  oled.drawHLine(
+    0,
+    31,
+    128
+  );
+
+  oled.drawHLine(
+    0,
+    54,
+    128
+  );
+
+  oled.drawXBMP(
+    3,
+    1,
+    8,
+    8,
+    ISS_OLED_GLYPH
+  );
+
+  oled.drawStr(
+    14,
+    7,
+    "ISS FORECAST"
+  );
+
+  char currentTime[8];
+
+  formatISSOLEDLocalTime(
+    time(nullptr),
+    currentTime,
+    sizeof(currentTime)
+  );
+
+  const uint8_t timeWidth =
+      oled.getStrWidth(
+        currentTime
+      );
+
+  oled.drawStr(
+    124 -
+      timeWidth,
+    7,
+    currentTime
+  );
+
+  char dateTimeText[20];
+
+  oled.drawStr(
+    4,
+    17,
+    "NEXT PASS"
+  );
+
+  if (
+    forecastValid &&
+    nextPassUTC != 0
+  ) {
+    formatISSOLEDLocalDateTime(
+      nextPassUTC,
+      dateTimeText,
+      sizeof(dateTimeText)
+    );
+  }
+  else if (forecastBusy) {
+    strlcpy(
+      dateTimeText,
+      "CALCULATING",
+      sizeof(dateTimeText)
+    );
+  }
+  else {
+    strlcpy(
+      dateTimeText,
+      "NOT FOUND <14D",
+      sizeof(dateTimeText)
+    );
+  }
+
+  oled.drawStr(
+    4,
+    27,
+    dateTimeText
+  );
+
+  oled.drawStr(
+    4,
+    39,
+    "NEXT VISIBLE"
+  );
+
+  if (
+    forecastValid &&
+    nextVisibleUTC != 0
+  ) {
+    formatISSOLEDLocalDateTime(
+      nextVisibleUTC,
+      dateTimeText,
+      sizeof(dateTimeText)
+    );
+  }
+  else if (forecastBusy) {
+    strlcpy(
+      dateTimeText,
+      "CALCULATING",
+      sizeof(dateTimeText)
+    );
+  }
+  else {
+    strlcpy(
+      dateTimeText,
+      "NOT FOUND <14D",
+      sizeof(dateTimeText)
+    );
+  }
+
+  oled.drawStr(
+    4,
+    50,
+    dateTimeText
+  );
+
+  if (
+    forecastValid &&
+    nextVisibleUTC != 0 &&
+    nextVisibleMaxEl >= 0.0f
+  ) {
+    char maxText[16];
+
+    snprintf(
+      maxText,
+      sizeof(maxText),
+      "MAX EL %.0f",
+      (double)nextVisibleMaxEl
+    );
+
+    const uint8_t maxWidth =
+        oled.getStrWidth(
+          maxText
+        );
+
+    // Allow four pixels for the vector degree mark when right-aligning.
+    drawISSOLEDTextWithDegree(
+      120 -
+        maxWidth,
+      50,
+      maxText
+    );
+  }
+
+  const char *footer =
+      "OKUBO HEAVY INDUSTRIES";
+
+  // OHI house footer: deliberately left-justified, close to but clear of the
+  // outer frame.
+  oled.drawStr(
+    4,
+    62,
+    footer
+  );
+
+  oled.sendBuffer();
+}
+
+
+static bool getLocalQuarterHourState(
+  int64_t &slot,
+  uint16_t &secondsIntoQuarter
+) {
+  const time_t nowUTC =
+      time(nullptr);
+
+  if (nowUTC < 1700000000)
+    return false;
+
+  const int64_t localEpoch =
+      (int64_t)nowUTC +
+      (
+        (int64_t)
+        appConfig.utcOffsetMinutes *
+        60LL
+      );
+
+  constexpr int64_t QUARTER_SEC =
+      15LL * 60LL;
+
+  slot =
+      localEpoch /
+      QUARTER_SEC;
+
+  int64_t remainder =
+      localEpoch %
+      QUARTER_SEC;
+
+  if (remainder < 0)
+    remainder += QUARTER_SEC;
+
+  secondsIntoQuarter =
+      (uint16_t)remainder;
+
+  return true;
+}
+
+static bool takeISSOLEDManualForecastRequest() {
+  bool requested = false;
+
+  portENTER_CRITICAL(
+    &buttonCommandMux
+  );
+
+  if (pendingISSOLEDManualForecast) {
+    pendingISSOLEDManualForecast =
+        false;
+
+    requested =
+        true;
+  }
+
+  portEXIT_CRITICAL(
+    &buttonCommandMux
+  );
+
+  return requested;
+}
+
+
+static void serviceISSOLED() {
+  if (
+    !appConfig.enableISS ||
+    !appConfig.observerConfigured
+  ) {
+    sleepISSOLED();
+    return;
+  }
+
+  bool statusValid = false;
+  bool above = false;
+
+  portENTER_CRITICAL(
+    &issRenderMux
+  );
+
+  statusValid =
+      issObserverStatusValid;
+
+  above =
+      issAboveHorizon;
+
+  portEXIT_CRITICAL(
+    &issRenderMux
+  );
+
+  const uint32_t nowMs =
+      millis();
+
+  // -------------------------------------------------------------------------
+  // Explicit button request — highest OLED priority.
+  // -------------------------------------------------------------------------
+  //
+  // Every debounced physical press starts/restarts a full 30-second forecast
+  // window.  This is independent of whether that press eventually becomes a
+  // 1-click, 2-click, 3-click or long-press cloud-playback gesture.
+  if (
+    takeISSOLEDManualForecastRequest()
+  ) {
+    issOLEDManualForecastUntilMs =
+        nowMs +
+        ISS_OLED_FORECAST_DURATION_MS;
+
+    lastISSOLEDRefreshMs = 0;
+
+    Serial.println(
+      "[ISS OLED] Manual forecast 30s"
+    );
+  }
+
+  const bool manualForecastActive =
+      issOLEDManualForecastUntilMs != 0 &&
+      (int32_t)(
+        issOLEDManualForecastUntilMs -
+        nowMs
+      ) > 0;
+
+  if (manualForecastActive) {
+    // If a clock quarter-hour passes while a manual page is occupying the
+    // OLED, consume that slot so we do not get a redundant one-second
+    // periodic page immediately after the manual 30-second window expires.
+    int64_t currentQuarterSlot = -1;
+    uint16_t secondsIntoQuarter = 0;
+
+    if (
+      getLocalQuarterHourState(
+        currentQuarterSlot,
+        secondsIntoQuarter
+      )
+    ) {
+      const bool inQuarterStartWindow =
+          secondsIntoQuarter <
+          (
+            ISS_OLED_FORECAST_DURATION_MS /
+            1000UL
+          );
+
+      if (inQuarterStartWindow) {
+        issOLEDForecastClockInitialised =
+            true;
+
+        issOLEDForecastLastQuarterSlot =
+            currentQuarterSlot;
+      }
+    }
+
+    if (
+      !issOLEDActive ||
+      issOLEDMode !=
+        ISS_OLED_MODE_FORECAST ||
+      lastISSOLEDRefreshMs == 0 ||
+      nowMs -
+        lastISSOLEDRefreshMs >=
+        ISS_OLED_REFRESH_MS
+    ) {
+      lastISSOLEDRefreshMs =
+          nowMs;
+
+      drawISSForecastOLEDScreen();
+    }
+
+    return;
+  }
+
+  // A manual window has just expired.  Clear its timer and release the OLED
+  // back to normal priority.  If a real pass is still active, its live page
+  // will be drawn immediately below.
+  if (
+    issOLEDManualForecastUntilMs != 0
+  ) {
+    issOLEDManualForecastUntilMs = 0;
+
+    if (
+      issOLEDActive &&
+      issOLEDMode ==
+        ISS_OLED_MODE_FORECAST
+    ) {
+      sleepISSOLED();
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Live ISS pass — normal highest automatic priority.
+  // -------------------------------------------------------------------------
+  if (
+    statusValid &&
+    above
+  ) {
+    if (
+      !issOLEDActive ||
+      issOLEDMode !=
+        ISS_OLED_MODE_PASS ||
+      lastISSOLEDRefreshMs == 0 ||
+      nowMs -
+        lastISSOLEDRefreshMs >=
+        ISS_OLED_REFRESH_MS
+    ) {
+      lastISSOLEDRefreshMs =
+          nowMs;
+
+      drawISSOLEDScreen();
+    }
+
+    return;
+  }
+
+  // If a pass ends, sleep immediately. Do NOT restart a relative 15-minute
+  // countdown; the next automatic forecast remains clock aligned.
+  if (
+    issOLEDActive &&
+    issOLEDMode ==
+      ISS_OLED_MODE_PASS
+  ) {
+    sleepISSOLED();
+  }
+
+  // -------------------------------------------------------------------------
+  // Existing automatic quarter-hour forecast page.
+  // -------------------------------------------------------------------------
+  if (
+    issOLEDActive &&
+    issOLEDMode ==
+      ISS_OLED_MODE_FORECAST
+  ) {
+    if (
+      (int32_t)(
+        nowMs -
+        issOLEDForecastUntilMs
+      ) >= 0
+    ) {
+      sleepISSOLED();
+      return;
+    }
+
+    if (
+      lastISSOLEDRefreshMs == 0 ||
+      nowMs -
+        lastISSOLEDRefreshMs >=
+        ISS_OLED_REFRESH_MS
+    ) {
+      lastISSOLEDRefreshMs =
+          nowMs;
+
+      drawISSForecastOLEDScreen();
+    }
+
+    return;
+  }
+
+  int64_t quarterSlot = -1;
+  uint16_t secondsIntoQuarter = 0;
+
+  if (
+    !getLocalQuarterHourState(
+      quarterSlot,
+      secondsIntoQuarter
+    )
+  ) {
+    return;
+  }
+
+  // Only the first 30 seconds of an actual wall-clock quarter-hour are an
+  // eligible automatic forecast-start window.
+  const bool inQuarterStartWindow =
+      secondsIntoQuarter <
+      (
+        ISS_OLED_FORECAST_DURATION_MS /
+        1000UL
+      );
+
+  if (
+    !issOLEDForecastClockInitialised
+  ) {
+    issOLEDForecastClockInitialised =
+        true;
+
+    if (inQuarterStartWindow) {
+      issOLEDForecastLastQuarterSlot =
+          quarterSlot -
+          1;
+    }
+    else {
+      issOLEDForecastLastQuarterSlot =
+          quarterSlot;
+    }
+  }
+
+  if (
+    inQuarterStartWindow &&
+    quarterSlot !=
+      issOLEDForecastLastQuarterSlot
+  ) {
+    issOLEDForecastLastQuarterSlot =
+        quarterSlot;
+
+    // End at the true +30 second wall-clock point for automatic pages.
+    const uint32_t elapsedMs =
+        (uint32_t)
+        secondsIntoQuarter *
+        1000UL;
+
+    const uint32_t remainingMs =
+        elapsedMs <
+          ISS_OLED_FORECAST_DURATION_MS ?
+        ISS_OLED_FORECAST_DURATION_MS -
+          elapsedMs :
+        1UL;
+
+    issOLEDForecastUntilMs =
+        nowMs +
+        remainingMs;
+
+    lastISSOLEDRefreshMs = 0;
+
+    drawISSForecastOLEDScreen();
+  }
+}
+
+
+
+static void resetRuntimeConfigDefaults() {
+  appConfig.wifiSSID[0] = '\0';
+  appConfig.wifiPassword[0] = '\0';
+
+  // Sensible project default; change freely in /config.ini.
+  appConfig.utcOffsetMinutes = 9 * 60;
+  strlcpy(
+    appConfig.timezoneLabel,
+    "JST",
+    sizeof(appConfig.timezoneLabel)
+  );
+
+  appConfig.enableISS = true;
+  appConfig.enableClouds = true;
+  appConfig.enableDayNight = true;
+
+  // NaN means "not supplied"; unlike 0,0 it cannot accidentally create an
+  // observer in the Gulf of Guinea when the config keys are missing.
+  appConfig.observerLatDeg = NAN;
+  appConfig.observerLonDeg = NAN;
+  appConfig.observerAltM = NAN;
+  appConfig.observerConfigured = false;
+
+  // Geometric horizon by default. Users with terrain/buildings can raise this.
+  appConfig.visibleMinElevationDeg = 0.0;
+
+  // Observer Sun below civil twilight is a useful conservative definition of
+  // a dark-enough sky for naked-eye ISS viewing.
+  appConfig.visibleSunMaxElevationDeg = -6.0;
+}
+
+static bool parseConfigBool(
+  String value,
+  bool &out
+) {
+  value.trim();
+  value.toLowerCase();
+
+  if (
+    value == "1" ||
+    value == "true" ||
+    value == "yes" ||
+    value == "on"
+  ) {
+    out = true;
+    return true;
+  }
+
+  if (
+    value == "0" ||
+    value == "false" ||
+    value == "no" ||
+    value == "off"
+  ) {
+    out = false;
+    return true;
+  }
+
+  return false;
+}
+
+static bool parseConfigDouble(
+  const String &value,
+  double &out
+) {
+  String clean =
+      value;
+
+  clean.trim();
+
+  if (clean.length() == 0)
+    return false;
+
+  char *end = nullptr;
+
+  const double parsed =
+      strtod(
+        clean.c_str(),
+        &end
+      );
+
+  if (
+    end ==
+      clean.c_str() ||
+    !end ||
+    *end != '\0' ||
+    !isfinite(parsed)
+  ) {
+    return false;
+  }
+
+  out = parsed;
+  return true;
+}
+
+static void stripOptionalQuotes(
+  String &value
+) {
+  value.trim();
+
+  if (
+    value.length() >= 2 &&
+    (
+      (
+        value[0] == '"' &&
+        value[
+          value.length() - 1
+        ] == '"'
+      ) ||
+      (
+        value[0] == '\'' &&
+        value[
+          value.length() - 1
+        ] == '\''
+      )
+    )
+  ) {
+    value =
+        value.substring(
+          1,
+          value.length() - 1
+        );
+  }
+}
+
+static void printTimezoneConfig() {
+  const int offset =
+      appConfig.utcOffsetMinutes;
+
+  const char sign =
+      offset < 0 ?
+      '-' :
+      '+';
+
+  const int absMinutes =
+      abs(offset);
+
+  Serial.printf(
+    "[CFG] TZ %s %c%02d:%02d\n",
+    appConfig.timezoneLabel,
+    sign,
+    absMinutes / 60,
+    absMinutes % 60
+  );
+}
+
+static bool loadRuntimeConfig() {
+  resetRuntimeConfigDefaults();
+
+  if (
+    !sdReady ||
+    !SD.exists(
+      RUNTIME_CONFIG_FILE
+    )
+  ) {
+    Serial.println(
+      "[CFG] /config.ini missing; using defaults"
+    );
+
+    printTimezoneConfig();
+
+    Serial.printf(
+      "[CFG] ISS=%u CLOUDS=%u DAY_NIGHT=%u\n",
+      appConfig.enableISS ? 1u : 0u,
+      appConfig.enableClouds ? 1u : 0u,
+      appConfig.enableDayNight ? 1u : 0u
+    );
+
+    return false;
+  }
+
+  File f =
+      SD.open(
+        RUNTIME_CONFIG_FILE,
+        FILE_READ
+      );
+
+  if (!f) {
+    Serial.println(
+      "[CFG] Could not open /config.ini"
+    );
+
+    return false;
+  }
+
+  uint16_t lineNumber = 0;
+
+  while (f.available()) {
+    String line =
+        f.readStringUntil('\n');
+
+    ++lineNumber;
+
+    line.replace("\r", "");
+    line.trim();
+
+    if (
+      line.length() == 0 ||
+      line.startsWith("#") ||
+      line.startsWith(";")
+    ) {
+      continue;
+    }
+
+    const int equals =
+        line.indexOf('=');
+
+    if (equals <= 0) {
+      Serial.printf(
+        "[CFG] Ignoring line %u\n",
+        (unsigned)lineNumber
+      );
+
+      continue;
+    }
+
+    String key =
+        line.substring(
+          0,
+          equals
+        );
+
+    String value =
+        line.substring(
+          equals + 1
+        );
+
+    key.trim();
+    key.toUpperCase();
+
+    stripOptionalQuotes(
+      value
+    );
+
+    if (key == "WIFI_SSID") {
+      strlcpy(
+        appConfig.wifiSSID,
+        value.c_str(),
+        sizeof(appConfig.wifiSSID)
+      );
+    }
+    else if (
+      key == "WIFI_PASSWORD"
+    ) {
+      strlcpy(
+        appConfig.wifiPassword,
+        value.c_str(),
+        sizeof(appConfig.wifiPassword)
+      );
+    }
+    else if (
+      key == "UTC_OFFSET_MINUTES"
+    ) {
+      const long minutes =
+          value.toInt();
+
+      if (
+        minutes >= -720 &&
+        minutes <= 840
+      ) {
+        appConfig.utcOffsetMinutes =
+            (int16_t)minutes;
+      }
+      else {
+        Serial.printf(
+          "[CFG] Bad UTC offset on line %u\n",
+          (unsigned)lineNumber
+        );
+      }
+    }
+    else if (
+      key == "TIMEZONE_LABEL"
+    ) {
+      if (value.length() > 0) {
+        strlcpy(
+          appConfig.timezoneLabel,
+          value.c_str(),
+          sizeof(appConfig.timezoneLabel)
+        );
+      }
+    }
+    else if (
+      key == "OBSERVER_LAT"
+    ) {
+      double parsed;
+
+      if (
+        parseConfigDouble(
+          value,
+          parsed
+        ) &&
+        parsed >= -90.0 &&
+        parsed <= 90.0
+      ) {
+        appConfig.observerLatDeg =
+            parsed;
+      }
+      else {
+        Serial.printf(
+          "[CFG] Bad OBSERVER_LAT on line %u\n",
+          (unsigned)lineNumber
+        );
+      }
+    }
+    else if (
+      key == "OBSERVER_LON"
+    ) {
+      double parsed;
+
+      if (
+        parseConfigDouble(
+          value,
+          parsed
+        ) &&
+        parsed >= -180.0 &&
+        parsed <= 180.0
+      ) {
+        appConfig.observerLonDeg =
+            parsed;
+      }
+      else {
+        Serial.printf(
+          "[CFG] Bad OBSERVER_LON on line %u\n",
+          (unsigned)lineNumber
+        );
+      }
+    }
+    else if (
+      key == "OBSERVER_ALT_M"
+    ) {
+      double parsed;
+
+      if (
+        parseConfigDouble(
+          value,
+          parsed
+        ) &&
+        parsed >= -500.0 &&
+        parsed <= 10000.0
+      ) {
+        appConfig.observerAltM =
+            parsed;
+      }
+      else {
+        Serial.printf(
+          "[CFG] Bad OBSERVER_ALT_M on line %u\n",
+          (unsigned)lineNumber
+        );
+      }
+    }
+    else if (
+      key == "VISIBLE_MIN_ELEVATION_DEG"
+    ) {
+      double parsed;
+
+      if (
+        parseConfigDouble(
+          value,
+          parsed
+        ) &&
+        parsed >= 0.0 &&
+        parsed <= 45.0
+      ) {
+        appConfig.visibleMinElevationDeg =
+            parsed;
+      }
+      else {
+        Serial.printf(
+          "[CFG] Bad VISIBLE_MIN_ELEVATION_DEG on line %u\n",
+          (unsigned)lineNumber
+        );
+      }
+    }
+    else if (
+      key == "VISIBLE_SUN_MAX_ELEVATION_DEG"
+    ) {
+      double parsed;
+
+      if (
+        parseConfigDouble(
+          value,
+          parsed
+        ) &&
+        parsed >= -18.0 &&
+        parsed <= 0.0
+      ) {
+        appConfig.visibleSunMaxElevationDeg =
+            parsed;
+      }
+      else {
+        Serial.printf(
+          "[CFG] Bad VISIBLE_SUN_MAX_ELEVATION_DEG on line %u\n",
+          (unsigned)lineNumber
+        );
+      }
+    }
+    else if (key == "ISS") {
+      bool parsed;
+
+      if (
+        parseConfigBool(
+          value,
+          parsed
+        )
+      ) {
+        appConfig.enableISS =
+            parsed;
+      }
+    }
+    else if (key == "CLOUDS") {
+      bool parsed;
+
+      if (
+        parseConfigBool(
+          value,
+          parsed
+        )
+      ) {
+        appConfig.enableClouds =
+            parsed;
+      }
+    }
+    else if (
+      key == "DAY_NIGHT"
+    ) {
+      bool parsed;
+
+      if (
+        parseConfigBool(
+          value,
+          parsed
+        )
+      ) {
+        appConfig.enableDayNight =
+            parsed;
+      }
+    }
+    else {
+      Serial.printf(
+        "[CFG] Unknown key on line %u\n",
+        (unsigned)lineNumber
+      );
+    }
+  }
+
+  f.close();
+
+  appConfig.observerConfigured =
+      isfinite(
+        appConfig.observerLatDeg
+      ) &&
+      isfinite(
+        appConfig.observerLonDeg
+      ) &&
+      isfinite(
+        appConfig.observerAltM
+      );
+
+  Serial.println(
+    "[CFG] Loaded /config.ini"
+  );
+
+  printTimezoneConfig();
+
+  Serial.printf(
+    "[CFG] ISS=%u CLOUDS=%u DAY_NIGHT=%u\n",
+    appConfig.enableISS ? 1u : 0u,
+    appConfig.enableClouds ? 1u : 0u,
+    appConfig.enableDayNight ? 1u : 0u
+  );
+
+  Serial.printf(
+    "[CFG] WiFi credentials %s\n",
+    appConfig.wifiSSID[0] ?
+      "loaded" :
+      "missing"
+  );
+
+  if (appConfig.observerConfigured) {
+    Serial.printf(
+      "[CFG] Observer configured; visible EL>=%.1f deg, Sun<=%.1f deg\n",
+      appConfig.visibleMinElevationDeg,
+      appConfig.visibleSunMaxElevationDeg
+    );
+  }
+  else {
+    Serial.println(
+      "[CFG] Observer not configured"
+    );
+  }
+
+  return true;
+}
+
+// -----------------------------------------------------------------------------
 // Wi-Fi + UTC
 // -----------------------------------------------------------------------------
+
+// Connect only when a network operation needs Wi-Fi.  Automatic reconnect is
+// disabled so a marginal RF link cannot enter a rapid driver reconnect loop;
+// callers simply invoke wifiConnect() again when they next need the network.
 
 static bool wifiConnect(
   uint32_t timeoutMs = 30000
@@ -590,22 +2983,47 @@ static bool wifiConnect(
   if (WiFi.status() == WL_CONNECTED)
     return true;
 
-  WiFi.mode(WIFI_STA);
+  if (appConfig.wifiSSID[0] == '\0') {
+    Serial.println(
+      "[WIFI] No credentials in /config.ini"
+    );
 
-  // Weak-signal installations benefit from disabling modem sleep during the
-  // short weather download session.
+    return false;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false);
+
+  // Keep the radio awake during weak-signal HTTPS transfers.
   WiFi.setSleep(false);
+
+  // Use the full Arduino-ESP32 station transmit-power setting. The finished
+  // unit can operate at weak RSSI, so modem sleep remains disabled while Wi-Fi
+  // is in use. No regulatory country is hard-coded here; the release therefore
+  // remains portable between regions. See README.md for an optional country-code
+  // example if a particular installation requires one.
+  delay(100);
+
+  const bool txPowerOK =
+      WiFi.setTxPower(
+        WIFI_POWER_19_5dBm
+      );
+
+  if (!txPowerOK) {
+    Serial.println(
+      "[WIFI] Warning: could not set TX power"
+    );
+  }
 
   for (uint8_t attempt = 1; attempt <= 2; ++attempt) {
     Serial.printf(
-      "[WIFI] Connecting to %s attempt %u/2\n",
-      WEATHER_WIFI_SSID,
+      "[WIFI] Connecting attempt %u/2\n",
       (unsigned)attempt
     );
 
     WiFi.begin(
-      WEATHER_WIFI_SSID,
-      WEATHER_WIFI_PASSWORD
+      appConfig.wifiSSID,
+      appConfig.wifiPassword
     );
 
     const uint32_t start =
@@ -620,27 +3038,30 @@ static bool wifiConnect(
 
     if (WiFi.status() == WL_CONNECTED) {
       Serial.printf(
-        "[WIFI] Connected RSSI=%d\n",
-        WiFi.RSSI()
+        "[WIFI] Connected RSSI=%d dBm channel=%d\n",
+        WiFi.RSSI(),
+        WiFi.channel()
       );
 
       return true;
     }
 
-    WiFi.disconnect();
-    delay(500);
+    WiFi.disconnect(false, false);
+    delay(750);
   }
 
-  Serial.println(
-    "[WIFI] Connection failed"
+  Serial.printf(
+    "[WIFI] Connection failed status=%d\n",
+    (int)WiFi.status()
   );
 
   return false;
 }
 
-static bool syncUTC(
-  uint32_t timeoutMs = 15000
-) {
+static void startNTPClientIfNeeded() {
+  if (ntpClientStarted)
+    return;
+
   configTime(
     0,
     0,
@@ -648,6 +3069,42 @@ static bool syncUTC(
     "time.google.com",
     "time.cloudflare.com"
   );
+
+  ntpClientStarted = true;
+
+  Serial.println(
+    "[TIME] SNTP client started"
+  );
+}
+
+static void printCurrentUTC(
+  const char *prefix
+) {
+  const time_t now =
+      time(nullptr);
+
+  if (now < 1700000000)
+    return;
+
+  struct tm t = {};
+  gmtime_r(&now, &t);
+
+  Serial.printf(
+    "%s %04d-%02d-%02d %02d:%02d:%02d\n",
+    prefix,
+    t.tm_year + 1900,
+    t.tm_mon + 1,
+    t.tm_mday,
+    t.tm_hour,
+    t.tm_min,
+    t.tm_sec
+  );
+}
+
+static bool syncUTC(
+  uint32_t timeoutMs = 15000
+) {
+  startNTPClientIfNeeded();
 
   const uint32_t start =
       millis();
@@ -659,28 +3116,42 @@ static bool syncUTC(
     delay(250);
   }
 
-  const time_t now =
-      time(nullptr);
+  if (
+    time(nullptr) <
+    1700000000
+  ) {
+    Serial.printf(
+      "[TIME] NTP still pending after %lu ms; SNTP continues in background\n",
+      (unsigned long)timeoutMs
+    );
 
-  if (now < 1700000000) {
-    Serial.println("[TIME] NTP failed");
     return false;
   }
 
-  struct tm t = {};
-  gmtime_r(&now, &t);
+  ntpTimeConfirmed = true;
 
-  Serial.printf(
-    "[TIME] UTC %04d-%02d-%02d %02d:%02d:%02d\n",
-    t.tm_year + 1900,
-    t.tm_mon + 1,
-    t.tm_mday,
-    t.tm_hour,
-    t.tm_min,
-    t.tm_sec
+  printCurrentUTC(
+    "[TIME] UTC"
   );
 
   return true;
+}
+
+static void serviceLateNTPSyncLog() {
+  if (
+    !ntpClientStarted ||
+    ntpTimeConfirmed ||
+    time(nullptr) <
+      1700000000
+  ) {
+    return;
+  }
+
+  ntpTimeConfirmed = true;
+
+  printCurrentUTC(
+    "[TIME] Late SNTP sync UTC"
+  );
 }
 
 static void makeNSMCTime(
@@ -690,11 +3161,8 @@ static void makeNSMCTime(
   time_t now =
       time(nullptr);
 
-  now -=
-      (time_t)NSMC_SOURCE_LAG_MINUTES *
-      60;
-
   // Fallback only: the official availability API is the primary source.
+  // Use the current UTC hour immediately; there is no deliberate source lag.
   // Round down to a whole UTC hour.
   now -=
       now %
@@ -753,6 +3221,7 @@ static bool downloadNSMCPNG(
   const char *datetimeUTC
 ) {
   downloadSize = 0;
+  lastNSMCTransportCode = 0;
 
   const String url =
       makeNSMCURL(
@@ -788,30 +3257,31 @@ static bool downloadNSMCPNG(
     datetimeUTC
   );
 
-  const uint32_t getStartMs =
-      millis();
-
-  Serial.println(
-    "[HTTP] TLS/connect/request..."
-  );
-
   const int code =
       http.GET();
 
-  Serial.printf(
-    "[HTTP] GET returned %d after %lu ms\n",
-    code,
-    (unsigned long)(
-      millis() -
-      getStartMs
-    )
-  );
-
   if (code != HTTP_CODE_OK) {
-    Serial.printf(
-      "[HTTP] status=%d\n",
-      code
-    );
+    if (code < 0) {
+      lastNSMCTransportCode =
+          code;
+
+      const String errorText =
+          http.errorToString(
+            code
+          );
+
+      Serial.printf(
+        "[HTTP] transport error=%d (%s)\n",
+        code,
+        errorText.c_str()
+      );
+    }
+    else {
+      Serial.printf(
+        "[HTTP] status=%d\n",
+        code
+      );
+    }
 
     http.end();
     return false;
@@ -1029,12 +3499,8 @@ static bool downloadNSMCPNG(
   }
 
   Serial.printf(
-    "[HTTP] PNG received %u bytes in %lu ms\n",
-    (unsigned)downloadSize,
-    (unsigned long)(
-      millis() -
-      bodyStartMs
-    )
+    "[NSMC] PNG received %u bytes\n",
+    (unsigned)downloadSize
   );
 
   httpBodyExpected = -1;
@@ -1131,6 +3597,7 @@ static int irPNGDraw(
       (uint32_t)pDraw->y *
       IR_W;
 
+
   for (int x = 0; x < pDraw->iWidth; ++x) {
     uint8_t r, g, b, a;
 
@@ -1164,7 +3631,6 @@ static int irPNGDraw(
       (uint32_t)x
     ] = a;
 
-    ++decodeOpaquePixels;
 
     // Perceptual luminance, integer approximation:
     //   0.2126 R + 0.7152 G + 0.0722 B
@@ -1177,6 +3643,7 @@ static int irPNGDraw(
           ) >> 8
         );
 
+
     decodeTarget[
       rowBase +
       (uint32_t)x
@@ -1187,8 +3654,14 @@ static int irPNGDraw(
 }
 
 static bool decodeNSMCIR() {
-  if (!ensurePNGDecoder())
+  // Decode the pristine NSMC PNG directly. No IDAT rewriting is needed once
+  // PNGdec's 320px RGBA scanline-buffer overflow is corrected.
+  uint8_t *decodeData = downloadBuffer;
+  const size_t decodeBytes = downloadSize;
+
+  if (!ensurePNGDecoder()) {
     return false;
+  }
 
   memset(
     candidateLuma,
@@ -1209,12 +3682,11 @@ static bool decodeNSMCIR() {
       candidateAlpha;
 
   decodeError = false;
-  decodeOpaquePixels = 0;
 
   const int rcOpen =
       pngDecoder->openRAM(
-        downloadBuffer,
-        (int)downloadSize,
+        decodeData,
+        (int)decodeBytes,
         irPNGDraw
       );
 
@@ -1226,17 +3698,9 @@ static bool decodeNSMCIR() {
 
     decodeTarget = nullptr;
     decodeTargetAlpha = nullptr;
+    releasePNGDecoder();
     return false;
   }
-
-  Serial.printf(
-    "[PNG] specs %d x %d bpp=%d type=%d alpha=%d\n",
-    pngDecoder->getWidth(),
-    pngDecoder->getHeight(),
-    pngDecoder->getBpp(),
-    pngDecoder->getPixelType(),
-    pngDecoder->hasAlpha()
-  );
 
   if (
     pngDecoder->getWidth() != IR_W ||
@@ -1245,6 +3709,7 @@ static bool decodeNSMCIR() {
     pngDecoder->close();
     decodeTarget = nullptr;
     decodeTargetAlpha = nullptr;
+    releasePNGDecoder();
     return false;
   }
 
@@ -1260,6 +3725,7 @@ static bool decodeNSMCIR() {
   pngDecoder->close();
   decodeTarget = nullptr;
   decodeTargetAlpha = nullptr;
+  releasePNGDecoder();
 
   if (
     rc != PNG_SUCCESS ||
@@ -1275,11 +3741,6 @@ static bool decodeNSMCIR() {
     return false;
   }
 
-  Serial.printf(
-    "[PNG] decoded opaque pixels=%lu/%lu\n",
-    (unsigned long)decodeOpaquePixels,
-    (unsigned long)IR_PIXELS
-  );
 
   return true;
 }
@@ -1381,13 +3842,6 @@ static bool analyseIRAndBuildOpacity() {
         0.10f
       );
 
-  const uint8_t p50L =
-      percentileFromHistogram(
-        histLuma,
-        opaque,
-        0.50f
-      );
-
   const uint8_t p95L =
       percentileFromHistogram(
         histLuma,
@@ -1402,13 +3856,6 @@ static bool analyseIRAndBuildOpacity() {
         0.10f
       );
 
-  const uint8_t p50A =
-      percentileFromHistogram(
-        histAlpha,
-        opaque,
-        0.50f
-      );
-
   const uint8_t p95A =
       percentileFromHistogram(
         histAlpha,
@@ -1420,19 +3867,6 @@ static bool analyseIRAndBuildOpacity() {
       (float)sumAlpha /
       (float)opaque;
 
-  Serial.printf(
-    "[IR] opaque=%.1f%%  luma mean=%.1f sd=%.1f p10=%u p50=%u p95=%u | alpha mean=%.1f p10=%u p50=%u p95=%u\n",
-    100.0f * (float)opaque / (float)IR_PIXELS,
-    meanLuma,
-    stddevLuma,
-    p10L,
-    p50L,
-    p95L,
-    meanAlpha,
-    p10A,
-    p50A,
-    p95A
-  );
 
   if (
     stddevLuma < 2.0f &&
@@ -1530,13 +3964,10 @@ static bool analyseIRAndBuildOpacity() {
   }
 
   Serial.printf(
-    "[IR] opacity mode=%s alphaScale=%u lumaLow=%.0f lumaHigh=%.0f\n",
+    "[IR] Cloud mapping: %s\n",
     candidateUseAlphaPrimaryOpacity ?
-      "alpha-primary" :
-      "alpha*luma",
-    (unsigned)candidateGlobalCloudAlphaScale,
-    low,
-    high
+      "source alpha" :
+      "alpha + luminance"
   );
 
   return true;
@@ -1838,7 +4269,7 @@ static void commitCandidate(
   memcpy(
     cloudOpacityLUT,
     candidateCloudOpacityLUT,
-    sizeof(cloudOpacityLUT)
+    256
   );
 
   globalCloudAlphaScale =
@@ -1857,10 +4288,14 @@ static void commitCandidate(
 
   haveIRClouds = true;
 
-  if (cloudMutex)
+  if (
+    appConfig.enableClouds &&
+    cloudMutex
+  ) {
     xSemaphoreGive(
       cloudMutex
     );
+  }
 }
 
 static bool processDownloadedFrame(
@@ -1912,6 +4347,80 @@ static bool loadArchivedFrame(
         activate,
         false
       );
+}
+
+static bool activateNewestArchivedHourlyFrame() {
+  if (
+    !appConfig.enableClouds ||
+    !sdReady
+  ) {
+    return false;
+  }
+
+  if (
+    time(nullptr) <
+    1700000000
+  ) {
+    return false;
+  }
+
+  // Search newest -> oldest through the same seven-day weather window used by
+  // the archive repair system.  This is an SD-only fallback: no network
+  // request is made here.
+  constexpr int ARCHIVE_BOOTSTRAP_HOURS =
+      7 * 24;
+
+  for (
+    int hoursAgo = 0;
+    hoursAgo <
+      ARCHIVE_BOOTSTRAP_HOURS;
+    ++hoursAgo
+  ) {
+    char stamp[13];
+
+    makeNSMCTime(
+      hoursAgo,
+      stamp
+    );
+
+    if (
+      !archiveExists(
+        stamp
+      )
+    ) {
+      continue;
+    }
+
+    Serial.printf(
+      "[LIVE] SD bootstrap trying %s UTC\n",
+      stamp
+    );
+
+    if (
+      loadArchivedFrame(
+        stamp,
+        true
+      )
+    ) {
+      Serial.printf(
+        "[LIVE] SD bootstrap active %s UTC\n",
+        stamp
+      );
+
+      return true;
+    }
+
+    Serial.printf(
+      "[LIVE] SD bootstrap rejected %s UTC; trying older frame\n",
+      stamp
+    );
+  }
+
+  Serial.println(
+    "[LIVE] SD bootstrap found no usable archived frame"
+  );
+
+  return false;
 }
 
 // -----------------------------------------------------------------------------
@@ -1971,29 +4480,34 @@ static bool downloadNSMCAvailabilityJSON() {
     (unsigned)NSMC_AVAILABILITY_HOURS
   );
 
-  const uint32_t getStartMs =
-      millis();
-
   const int code =
       http.GET();
 
-  Serial.printf(
-    "[AVAIL] GET returned %d after %lu ms\n",
-    code,
-    (unsigned long)(
-      millis() -
-      getStartMs
-    )
-  );
-
   if (code != HTTP_CODE_OK) {
+    if (code < 0) {
+      lastNSMCTransportCode =
+          code;
+
+      const String errorText =
+          http.errorToString(
+            code
+          );
+
+      Serial.printf(
+        "[AVAIL] transport error=%d (%s)\n",
+        code,
+        errorText.c_str()
+      );
+
+    }
+    else {
+      Serial.printf(
+        "[AVAIL] HTTP status=%d\n",
+        code
+      );
+    }
+
     http.end();
-
-    Serial.printf(
-      "[AVAIL] HTTP status=%d\n",
-      code
-    );
-
     return false;
   }
 
@@ -2165,11 +4679,6 @@ static bool downloadNSMCAvailabilityJSON() {
 
   downloadBuffer[downloadSize] =
       '\0';
-
-  Serial.printf(
-    "[AVAIL] JSON received %u bytes\n",
-    (unsigned)downloadSize
-  );
 
   return true;
 }
@@ -2383,23 +4892,9 @@ static bool parseNSMCAvailabilityJSON() {
 }
 
 static bool fetchNSMCAvailability() {
-  // The availability list itself does not need local time, but selecting the
-  // safe newest frame does. Recover automatically if boot-time NTP failed.
-  if (
-    time(nullptr) <
-    1700000000
-  ) {
-    if (!wifiConnect())
-      return false;
-
-    Serial.println(
-      "[AVAIL] UTC invalid; retrying NTP"
-    );
-
-    if (!syncUTC())
-      return false;
-  }
-
+  // No UTC gate is required here: the official availability list itself is
+  // authoritative. This allows cloud updates to proceed even while SNTP is
+  // still synchronizing.
   if (!downloadNSMCAvailabilityJSON())
     return false;
 
@@ -2407,62 +4902,12 @@ static bool fetchNSMCAvailability() {
       parseNSMCAvailabilityJSON();
 }
 
-static void makeAvailabilityCutoff(
-  char out[13]
-) {
-  const time_t cutoff =
-      time(nullptr) -
-      (time_t)
-      NSMC_SOURCE_LAG_MINUTES *
-      60;
-
-  formatUTCStamp(
-    cutoff,
-    out
-  );
-}
-
-static bool stampEligibleForUse(
-  const char *stamp,
-  const char *cutoff
-) {
-  return
-      strcmp(
-        stamp,
-        cutoff
-      ) <= 0;
-}
-
-static int newestEligibleAvailabilityIndex() {
-  if (
-    nsmcAvailableCount == 0
-  ) {
+static int newestAvailabilityIndex() {
+  if (nsmcAvailableCount == 0)
     return -1;
-  }
 
-  char cutoff[13];
-
-  makeAvailabilityCutoff(
-    cutoff
-  );
-
-  for (
-    int i =
-        (int)nsmcAvailableCount - 1;
-    i >= 0;
-    --i
-  ) {
-    if (
-      stampEligibleForUse(
-        nsmcAvailableTimes[i],
-        cutoff
-      )
-    ) {
-      return i;
-    }
-  }
-
-  return -1;
+  return
+      (int)nsmcAvailableCount - 1;
 }
 
 static bool removeArchivedStamp(
@@ -2493,11 +4938,11 @@ static bool removeArchivedStamp(
 
 static bool activateNewestAvailableFrame() {
   const int newest =
-      newestEligibleAvailabilityIndex();
+      newestAvailabilityIndex();
 
   if (newest < 0) {
     Serial.println(
-      "[LIVE] No eligible NSMC timestamp"
+      "[LIVE] No NSMC timestamp listed"
     );
 
     return false;
@@ -2621,12 +5066,6 @@ static uint16_t countMissingAvailableFrames() {
     return 0;
   }
 
-  char cutoff[13];
-
-  makeAvailabilityCutoff(
-    cutoff
-  );
-
   uint16_t missing = 0;
 
   for (
@@ -2635,15 +5074,6 @@ static uint16_t countMissingAvailableFrames() {
       nsmcAvailableCount;
     ++i
   ) {
-    if (
-      !stampEligibleForUse(
-        nsmcAvailableTimes[i],
-        cutoff
-      )
-    ) {
-      continue;
-    }
-
     if (
       !archiveExists(
         nsmcAvailableTimes[i]
@@ -2656,25 +5086,46 @@ static uint16_t countMissingAvailableFrames() {
   return missing;
 }
 
-static void repairArchiveGapsFromAvailability() {
+static void finishArchiveGapRepairPass() {
+  const uint16_t remaining =
+      countMissingAvailableFrames();
+
+  Serial.printf(
+    "[GAP] Pass done: saved=%u failed=%u remaining=%u\n",
+    (unsigned)gapRepairSaved,
+    (unsigned)gapRepairFailed,
+    (unsigned)remaining
+  );
+
+  gapRepairPassPending = false;
+  gapRepairCursor = -1;
+  backfillActive = false;
+}
+
+static void startArchiveGapRepairPass() {
   if (
     !sdReady ||
     nsmcAvailableCount == 0
   ) {
+    gapRepairPassPending = false;
+    gapRepairCursor = -1;
     backfillActive = false;
+    backfillDone = 0;
+    backfillTotal = 0;
     return;
   }
 
-  const uint16_t missingAtStart =
+  const uint16_t missing =
       countMissingAvailableFrames();
 
   backfillDone = 0;
-  backfillTotal =
-      missingAtStart;
+  backfillTotal = missing;
+  gapRepairSaved = 0;
+  gapRepairFailed = 0;
 
-  if (
-    missingAtStart == 0
-  ) {
+  if (missing == 0) {
+    gapRepairPassPending = false;
+    gapRepairCursor = -1;
     backfillActive = false;
 
     Serial.println(
@@ -2684,108 +5135,117 @@ static void repairArchiveGapsFromAvailability() {
     return;
   }
 
+  gapRepairPassPending = true;
+  gapRepairCursor =
+      (int16_t)nsmcAvailableCount - 1;
   backfillActive = true;
 
   Serial.printf(
-    "[GAP] Repair queue: %u missing official frames\n",
-    (unsigned)missingAtStart
+    "[GAP] Repair queue: %u missing official frames; incremental mode\n",
+    (unsigned)missing
   );
+}
 
-  char cutoff[13];
-
-  makeAvailabilityCutoff(
-    cutoff
-  );
-
-  uint16_t saved = 0;
-  uint16_t failed = 0;
-
-  // Newest first: recent weather is more useful than an older repaired gap.
-  for (
-    int i =
-        (int)nsmcAvailableCount - 1;
-    i >= 0;
-    --i
+static void repairOneArchiveGapFromAvailability() {
+  if (
+    !gapRepairPassPending ||
+    !sdReady ||
+    nsmcAvailableCount == 0
   ) {
-    if (
-      replayActive ||
-      replayStartPending ||
-      pendingButtonEvent !=
-        (uint8_t)ButtonEvent::None
-    ) {
-      break;
-    }
+    return;
+  }
 
-    const char *stamp =
-        nsmcAvailableTimes[i];
+  if (
+    replayActive ||
+    replayStartPending ||
+    pendingButtonEvent !=
+      (uint8_t)ButtonEvent::None
+  ) {
+    return;
+  }
 
-    if (
-      !stampEligibleForUse(
-        stamp,
-        cutoff
-      )
-    ) {
-      continue;
-    }
+  // Find the next missing official frame, newest first.  Existing frames are
+  // skipped without consuming a network turn.
+  while (gapRepairCursor >= 0) {
+    const char *candidate =
+        nsmcAvailableTimes[gapRepairCursor];
 
-    if (archiveExists(stamp))
-      continue;
+    --gapRepairCursor;
 
-    Serial.printf(
-      "[GAP] Missing %s UTC\n",
-      stamp
-    );
+    if (!archiveExists(candidate)) {
+      char stamp[13];
+      memcpy(stamp, candidate, sizeof(stamp));
+      stamp[12] = '\0';
 
-    if (
-      workMutex &&
-      xSemaphoreTake(
-        workMutex,
-        portMAX_DELAY
-      ) == pdTRUE
-    ) {
-      // Re-check after obtaining the shared PNG/download lock.
+      Serial.printf(
+        "[GAP] Missing %s UTC\n",
+        stamp
+      );
+
+      bool saved = false;
+      bool transportUnavailable = false;
+
       if (
-        replayActive ||
-        replayStartPending ||
-        pendingButtonEvent !=
-          (uint8_t)ButtonEvent::None
+        workMutex &&
+        xSemaphoreTake(
+          workMutex,
+          portMAX_DELAY
+        ) == pdTRUE
       ) {
+        // Re-check user/replay state after obtaining the shared work lock.
+        if (
+          replayActive ||
+          replayStartPending ||
+          pendingButtonEvent !=
+            (uint8_t)ButtonEvent::None
+        ) {
+          xSemaphoreGive(
+            workMutex
+          );
+
+          // Put this candidate back at the head of the remaining pass so it is
+          // not accidentally skipped merely because the user pressed a button.
+          ++gapRepairCursor;
+          return;
+        }
+
+        if (
+          WiFi.status() !=
+            WL_CONNECTED &&
+          !wifiConnect()
+        ) {
+          Serial.println(
+            "[GAP] Wi-Fi unavailable; pausing repair until next availability pass"
+          );
+
+          transportUnavailable = true;
+        }
+        else {
+          saved =
+              fetchExactFrame(
+                stamp,
+                false,
+                true
+              );
+
+          if (
+            !saved &&
+            lastNSMCTransportCode < 0
+          ) {
+            transportUnavailable = true;
+          }
+        }
+
         xSemaphoreGive(
           workMutex
         );
-
-        break;
       }
 
-      if (
-        WiFi.status() !=
-          WL_CONNECTED &&
-        !wifiConnect()
-      ) {
-        Serial.println(
-          "[GAP] Wi-Fi unavailable; pausing repair until next pass"
-        );
-
-        ++failed;
-
-        xSemaphoreGive(
-          workMutex
-        );
-
-        break;
-      }
-
-      if (
-        fetchExactFrame(
-          stamp,
-          false,
-          true
-        )
-      ) {
-        ++saved;
+      if (saved) {
+        ++gapRepairSaved;
       }
       else {
-        ++failed;
+        ++gapRepairFailed;
 
         Serial.printf(
           "[GAP] %s still missing; will retry on a later pass\n",
@@ -2793,34 +5253,28 @@ static void repairArchiveGapsFromAvailability() {
         );
       }
 
-      xSemaphoreGive(
-        workMutex
-      );
-    }
+      if (
+        backfillDone <
+          backfillTotal
+      ) {
+        ++backfillDone;
+      }
 
-    if (
-      backfillDone <
-        backfillTotal
-    ) {
-      ++backfillDone;
-    }
+      // A transport outage will almost certainly make every subsequent frame
+      // fail too.  End this pass rather than hammering the same unavailable
+      // host; the next 15-minute availability refresh starts a fresh pass.
+      if (transportUnavailable) {
+        finishArchiveGapRepairPass();
+      }
 
-    vTaskDelay(
-      pdMS_TO_TICKS(250)
-    );
+      // Crucially: ONE network/archive attempt per worker turn.  Return now so
+      // ISS forecast and live-display services get CPU time before the next gap.
+      return;
+    }
   }
 
-  backfillActive = false;
-
-  const uint16_t remaining =
-      countMissingAvailableFrames();
-
-  Serial.printf(
-    "[GAP] Pass done: saved=%u failed=%u remaining=%u\n",
-    (unsigned)saved,
-    (unsigned)failed,
-    (unsigned)remaining
-  );
+  // Cursor exhausted: this incremental pass is complete.
+  finishArchiveGapRepairPass();
 }
 
 // -----------------------------------------------------------------------------
@@ -2889,10 +5343,41 @@ static bool fetchLatestNSMCIRFallbackHourly() {
 
       return true;
     }
+
+    if (
+      lastNSMCTransportCode <
+      0
+    ) {
+      Serial.printf(
+        "[LIVE] Transport unavailable (%d); aborting hourly retry batch\n",
+        lastNSMCTransportCode
+      );
+
+      break;
+    }
   }
 
   Serial.println(
-    "[LIVE] Hourly fallback found no usable image; keeping previous map"
+    "[LIVE] Hourly fallback found no usable network image"
+  );
+
+  if (
+    !haveIRClouds &&
+    sdReady
+  ) {
+    Serial.println(
+      "[LIVE] No live cloud map in RAM; trying newest SD archive"
+    );
+
+    if (
+      activateNewestArchivedHourlyFrame()
+    ) {
+      return true;
+    }
+  }
+
+  Serial.println(
+    "[LIVE] Keeping previous map"
   );
 
   return false;
@@ -2956,6 +5441,2727 @@ static bool initSDCard() {
   );
 
   return true;
+}
+
+
+// -----------------------------------------------------------------------------
+// ISS (ZARYA) TLE cache / CelesTrak throttle
+// -----------------------------------------------------------------------------
+
+static void ensureISSDir() {
+  if (
+    sdReady &&
+    !SD.exists(ISS_DIR)
+  ) {
+    SD.mkdir(ISS_DIR);
+  }
+}
+
+static bool writeTextFileAtomic(
+  const char *finalPath,
+  const char *tempPath,
+  const char *contents
+) {
+  if (
+    !sdReady ||
+    !finalPath ||
+    !tempPath ||
+    !contents
+  ) {
+    return false;
+  }
+
+  SD.remove(tempPath);
+
+  File f =
+      SD.open(
+        tempPath,
+        FILE_WRITE
+      );
+
+  if (!f)
+    return false;
+
+  const size_t expected =
+      strlen(contents);
+
+  const size_t written =
+      f.write(
+        (const uint8_t *)contents,
+        expected
+      );
+
+  f.flush();
+  f.close();
+
+  if (written != expected) {
+    SD.remove(tempPath);
+    return false;
+  }
+
+  SD.remove(finalPath);
+
+  if (
+    !SD.rename(
+      tempPath,
+      finalPath
+    )
+  ) {
+    SD.remove(tempPath);
+    return false;
+  }
+
+  return true;
+}
+
+static bool saveISSFetchState() {
+  if (!sdReady)
+    return false;
+
+  ensureISSDir();
+
+  char state[96];
+
+  snprintf(
+    state,
+    sizeof(state),
+    "last_attempt=%lld\n"
+    "last_success=%lld\n",
+    (long long)issLastAttemptUTC,
+    (long long)issLastSuccessUTC
+  );
+
+  const bool ok =
+      writeTextFileAtomic(
+        ISS_STATE_FILE,
+        "/iss/fetch_state.tmp",
+        state
+      );
+
+  if (!ok) {
+    Serial.println(
+      "[ISS] Could not save fetch state"
+    );
+  }
+
+  return ok;
+}
+
+static void loadISSFetchState() {
+  issLastAttemptUTC = 0;
+  issLastSuccessUTC = 0;
+
+  if (
+    !sdReady ||
+    !SD.exists(ISS_STATE_FILE)
+  ) {
+    return;
+  }
+
+  File f =
+      SD.open(
+        ISS_STATE_FILE,
+        FILE_READ
+      );
+
+  if (!f)
+    return;
+
+  while (f.available()) {
+    String line =
+        f.readStringUntil('\n');
+
+    line.trim();
+
+    if (
+      line.startsWith(
+        "last_attempt="
+      )
+    ) {
+      issLastAttemptUTC =
+          (time_t)strtoll(
+            line.c_str() + 13,
+            nullptr,
+            10
+          );
+    }
+    else if (
+      line.startsWith(
+        "last_success="
+      )
+    ) {
+      issLastSuccessUTC =
+          (time_t)strtoll(
+            line.c_str() + 13,
+            nullptr,
+            10
+          );
+    }
+  }
+
+  f.close();
+
+  Serial.printf(
+    "[ISS] State attempt=%lld success=%lld\n",
+    (long long)issLastAttemptUTC,
+    (long long)issLastSuccessUTC
+  );
+}
+
+static bool tleChecksumValid(
+  const char *line
+) {
+  if (!line)
+    return false;
+
+  const size_t len =
+      strlen(line);
+
+  if (len < 69)
+    return false;
+
+  if (
+    line[68] < '0' ||
+    line[68] > '9'
+  ) {
+    return false;
+  }
+
+  uint16_t sum = 0;
+
+  for (size_t i = 0; i < 68; ++i) {
+    const char c =
+        line[i];
+
+    if (
+      c >= '0' &&
+      c <= '9'
+    ) {
+      sum +=
+          (uint16_t)(
+            c - '0'
+          );
+    }
+    else if (c == '-') {
+      sum += 1;
+    }
+  }
+
+  return
+      (sum % 10) ==
+      (uint16_t)(
+        line[68] - '0'
+      );
+}
+
+static bool validateISSTLE(
+  const char *name,
+  const char *line1,
+  const char *line2
+) {
+  if (
+    !name ||
+    !line1 ||
+    !line2
+  ) {
+    return false;
+  }
+
+  if (
+    strcmp(
+      name,
+      "ISS (ZARYA)"
+    ) != 0
+  ) {
+    Serial.printf(
+      "[ISS] Wrong object name: %s\n",
+      name
+    );
+
+    return false;
+  }
+
+  if (
+    strncmp(
+      line1,
+      "1 25544",
+      7
+    ) != 0 ||
+    strncmp(
+      line2,
+      "2 25544",
+      7
+    ) != 0
+  ) {
+    Serial.println(
+      "[ISS] Wrong NORAD catalog number"
+    );
+
+    return false;
+  }
+
+  if (
+    !tleChecksumValid(line1) ||
+    !tleChecksumValid(line2)
+  ) {
+    Serial.println(
+      "[ISS] TLE checksum failed"
+    );
+
+    return false;
+  }
+
+  return true;
+}
+
+static bool saveISSTLE(
+  const char *name,
+  const char *line1,
+  const char *line2
+) {
+  if (!sdReady)
+    return false;
+
+  ensureISSDir();
+
+  char contents[224];
+
+  snprintf(
+    contents,
+    sizeof(contents),
+    "%s\n%s\n%s\n",
+    name,
+    line1,
+    line2
+  );
+
+  if (
+    !writeTextFileAtomic(
+      ISS_TLE_FILE,
+      "/iss/iss.tmp",
+      contents
+    )
+  ) {
+    Serial.println(
+      "[ISS] Could not save TLE"
+    );
+
+    return false;
+  }
+
+  return true;
+}
+
+static bool loadISSTLECache() {
+  haveISSTLE = false;
+
+  issTLEName[0] = '\0';
+  issTLELine1[0] = '\0';
+  issTLELine2[0] = '\0';
+
+  if (
+    !sdReady ||
+    !SD.exists(ISS_TLE_FILE)
+  ) {
+    Serial.println(
+      "[ISS] No cached TLE"
+    );
+
+    return false;
+  }
+
+  File f =
+      SD.open(
+        ISS_TLE_FILE,
+        FILE_READ
+      );
+
+  if (!f)
+    return false;
+
+  String name =
+      f.readStringUntil('\n');
+
+  String line1 =
+      f.readStringUntil('\n');
+
+  String line2 =
+      f.readStringUntil('\n');
+
+  f.close();
+
+  name.trim();
+  line1.trim();
+  line2.trim();
+
+  if (
+    !validateISSTLE(
+      name.c_str(),
+      line1.c_str(),
+      line2.c_str()
+    )
+  ) {
+    Serial.println(
+      "[ISS] Cached TLE invalid"
+    );
+
+    return false;
+  }
+
+  strlcpy(
+    issTLEName,
+    name.c_str(),
+    sizeof(issTLEName)
+  );
+
+  strlcpy(
+    issTLELine1,
+    line1.c_str(),
+    sizeof(issTLELine1)
+  );
+
+  strlcpy(
+    issTLELine2,
+    line2.c_str(),
+    sizeof(issTLELine2)
+  );
+
+  haveISSTLE = true;
+
+  Serial.println(
+    "[ISS] Cached ISS (ZARYA) TLE loaded"
+  );
+
+  return true;
+}
+
+static bool fetchISSTLEFromCelesTrak() {
+  if (
+    !sdReady ||
+    WiFi.status() != WL_CONNECTED
+  ) {
+    return false;
+  }
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setHandshakeTimeout(12);
+  client.setTimeout(15000);
+
+  HTTPClient http;
+
+  if (
+    !http.begin(
+      client,
+      ISS_TLE_URL
+    )
+  ) {
+    Serial.println(
+      "[ISS] HTTP begin failed"
+    );
+
+    return false;
+  }
+
+  http.useHTTP10(true);
+  http.setConnectTimeout(12000);
+  http.setTimeout(15000);
+
+  http.addHeader(
+    "Accept",
+    "text/plain"
+  );
+
+  http.addHeader(
+    "User-Agent",
+    "ESP32-S2-Live-Cloud-Globe/2.0"
+  );
+
+  Serial.println(
+    "[ISS] GET CelesTrak CATNR=25544 only"
+  );
+
+  const uint32_t startMs =
+      millis();
+
+  const int code =
+      http.GET();
+
+  Serial.printf(
+    "[ISS] GET returned %d after %lu ms\n",
+    code,
+    (unsigned long)(
+      millis() -
+      startMs
+    )
+  );
+
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  String body =
+      http.getString();
+
+  http.end();
+
+  body.replace("\r", "");
+
+  const int firstNL =
+      body.indexOf('\n');
+
+  const int secondNL =
+      (
+        firstNL >= 0
+      ) ?
+      body.indexOf(
+        '\n',
+        firstNL + 1
+      ) :
+      -1;
+
+  if (
+    firstNL < 0 ||
+    secondNL < 0
+  ) {
+    Serial.println(
+      "[ISS] Response did not contain 3 TLE lines"
+    );
+
+    return false;
+  }
+
+  String name =
+      body.substring(
+        0,
+        firstNL
+      );
+
+  String line1 =
+      body.substring(
+        firstNL + 1,
+        secondNL
+      );
+
+  int thirdNL =
+      body.indexOf(
+        '\n',
+        secondNL + 1
+      );
+
+  if (thirdNL < 0)
+    thirdNL = body.length();
+
+  String line2 =
+      body.substring(
+        secondNL + 1,
+        thirdNL
+      );
+
+  name.trim();
+  line1.trim();
+  line2.trim();
+
+  if (
+    !validateISSTLE(
+      name.c_str(),
+      line1.c_str(),
+      line2.c_str()
+    )
+  ) {
+    Serial.println(
+      "[ISS] CelesTrak response rejected"
+    );
+
+    return false;
+  }
+
+  if (
+    !saveISSTLE(
+      name.c_str(),
+      line1.c_str(),
+      line2.c_str()
+    )
+  ) {
+    // Do not mark this as a successful refresh unless it is safely cached.
+    return false;
+  }
+
+  strlcpy(
+    issTLEName,
+    name.c_str(),
+    sizeof(issTLEName)
+  );
+
+  strlcpy(
+    issTLELine1,
+    line1.c_str(),
+    sizeof(issTLELine1)
+  );
+
+  strlcpy(
+    issTLELine2,
+    line2.c_str(),
+    sizeof(issTLELine2)
+  );
+
+  haveISSTLE = true;
+
+  Serial.println(
+    "[ISS] ISS (ZARYA) TLE cached"
+  );
+
+  return true;
+}
+
+static bool issRefreshDue(
+  time_t now
+) {
+  if (
+    !haveISSTLE ||
+    issLastSuccessUTC <= 0
+  ) {
+    return true;
+  }
+
+  if (now <= issLastSuccessUTC)
+    return false;
+
+  return
+      (uint64_t)(
+        now -
+        issLastSuccessUTC
+      ) >=
+      ISS_SUCCESS_INTERVAL_SEC;
+}
+
+static bool issRetryAllowed(
+  time_t now
+) {
+  if (issLastAttemptUTC <= 0)
+    return true;
+
+  if (now <= issLastAttemptUTC)
+    return false;
+
+  return
+      (uint64_t)(
+        now -
+        issLastAttemptUTC
+      ) >=
+      ISS_RETRY_INTERVAL_SEC;
+}
+
+static bool serviceISSTLE(
+  bool bootMessage
+) {
+  if (!appConfig.enableISS)
+    return false;
+
+  if (!sdReady) {
+    if (bootMessage) {
+      bootPrintln(
+        "[ISS] No SD - no fetch"
+      );
+    }
+
+    return false;
+  }
+
+  const time_t now =
+      time(nullptr);
+
+  if (now < 1700000000) {
+    if (bootMessage) {
+      bootPrintln(
+        "[ISS] Waiting for UTC"
+      );
+    }
+
+    return false;
+  }
+
+  if (
+    !issRefreshDue(now)
+  ) {
+    if (bootMessage) {
+      uint32_t ageHours = 0;
+
+      if (
+        issLastSuccessUTC > 0 &&
+        now > issLastSuccessUTC
+      ) {
+        ageHours =
+            (uint32_t)(
+              (
+                now -
+                issLastSuccessUTC
+              ) /
+              3600
+            );
+      }
+
+      bootPrintf(
+        "[ISS] Cached %luh",
+        (unsigned long)ageHours
+      );
+    }
+
+    return true;
+  }
+
+  if (
+    !issRetryAllowed(now)
+  ) {
+    if (bootMessage) {
+      uint32_t waitMinutes = 0;
+
+      const time_t nextTry =
+          issLastAttemptUTC +
+          (time_t)ISS_RETRY_INTERVAL_SEC;
+
+      if (nextTry > now) {
+        waitMinutes =
+            (uint32_t)(
+              (
+                nextTry -
+                now +
+                59
+              ) /
+              60
+            );
+      }
+
+      bootPrintf(
+        "[ISS] Retry in %lum",
+        (unsigned long)waitMinutes
+      );
+    }
+
+    return haveISSTLE;
+  }
+
+  if (
+    WiFi.status() != WL_CONNECTED &&
+    !wifiConnect(12000)
+  ) {
+    if (bootMessage) {
+      bootPrintln(
+        "[ISS] WiFi unavailable"
+      );
+    }
+
+    // A Wi-Fi connection failure is intentionally NOT recorded as a
+    // CelesTrak attempt because no request reached CelesTrak.
+    return haveISSTLE;
+  }
+
+  // Persist the attempt BEFORE opening the HTTPS request.  If power is lost
+  // mid-request, the reboot still honours the 2-hour retry throttle.
+  issLastAttemptUTC =
+      now;
+
+  if (!saveISSFetchState()) {
+    Serial.println(
+      "[ISS] State persistence failed; request cancelled"
+    );
+
+    if (bootMessage) {
+      bootPrintln(
+        "[ISS] State save failed"
+      );
+    }
+
+    return haveISSTLE;
+  }
+
+  if (bootMessage) {
+    bootPrintln(
+      "[ISS] Refreshing TLE..."
+    );
+  }
+
+  if (
+    !fetchISSTLEFromCelesTrak()
+  ) {
+    if (bootMessage) {
+      bootPrintln(
+        "[ISS] Fetch failed"
+      );
+    }
+
+    return haveISSTLE;
+  }
+
+  // A valid response safely written to SD counts as one successful refresh.
+  // Even if CelesTrak happens to return the same orbital element set, do not
+  // request it again for another 24 hours.
+  issLastSuccessUTC =
+      now;
+
+  saveISSFetchState();
+
+  if (bootMessage) {
+    bootPrintln(
+      "[ISS] TLE OK / 24h"
+    );
+  }
+
+  return true;
+}
+
+
+// -----------------------------------------------------------------------------
+// ISS local propagation
+// -----------------------------------------------------------------------------
+
+static P13Satellite *issPredictor = nullptr;
+
+static char issPredictorLine1[80] = "";
+static char issPredictorLine2[80] = "";
+
+static uint32_t issLastOrbitBuildMillis = 0;
+static bool issFirstOrbitLogDone = false;
+
+static bool makeP13UTC(
+  time_t utc,
+  P13DateTime &dt
+) {
+  if (utc < 1700000000)
+    return false;
+
+  struct tm tmUTC;
+
+  if (
+    !gmtime_r(
+      &utc,
+      &tmUTC
+    )
+  ) {
+    return false;
+  }
+
+  dt.settime(
+    tmUTC.tm_year + 1900,
+    tmUTC.tm_mon + 1,
+    tmUTC.tm_mday,
+    tmUTC.tm_hour,
+    tmUTC.tm_min,
+    tmUTC.tm_sec
+  );
+
+  return true;
+}
+
+static bool ensureISSPredictor() {
+  if (!haveISSTLE)
+    return false;
+
+  const bool changed =
+      !issPredictor ||
+      strcmp(
+        issPredictorLine1,
+        issTLELine1
+      ) != 0 ||
+      strcmp(
+        issPredictorLine2,
+        issTLELine2
+      ) != 0;
+
+  if (!changed)
+    return true;
+
+  if (!issPredictor) {
+    issPredictor =
+        new (std::nothrow)
+        P13Satellite(
+          issTLEName,
+          issTLELine1,
+          issTLELine2
+        );
+
+    if (!issPredictor) {
+      Serial.println(
+        "[ISS] Propagator allocation failed"
+      );
+
+      return false;
+    }
+  }
+  else {
+    issPredictor->tle(
+      issTLEName,
+      issTLELine1,
+      issTLELine2
+    );
+  }
+
+  strlcpy(
+    issPredictorLine1,
+    issTLELine1,
+    sizeof(issPredictorLine1)
+  );
+
+  strlcpy(
+    issPredictorLine2,
+    issTLELine2,
+    sizeof(issPredictorLine2)
+  );
+
+  // Force fresh renderer and long-range forecast caches immediately after
+  // any TLE change.
+  issLastOrbitBuildMillis = 0;
+  issOrbitValid = false;
+  issUpcomingForecastValid = false;
+
+  Serial.println(
+    "[ISS] AioP13 propagator ready"
+  );
+
+  return true;
+}
+
+static bool readISSSpacePoint(
+  ISSSpacePoint &point
+) {
+  if (!issPredictor)
+    return false;
+
+  const double xKm =
+      issPredictor->c_vecS[0];
+
+  const double yKm =
+      issPredictor->c_vecS[1];
+
+  const double zKm =
+      issPredictor->c_vecS[2];
+
+  if (
+    !isfinite(xKm) ||
+    !isfinite(yKm) ||
+    !isfinite(zKm)
+  ) {
+    return false;
+  }
+
+  point.xER =
+      (float)(
+        xKm /
+        ISS_EARTH_RADIUS_KM
+      );
+
+  point.yER =
+      (float)(
+        yKm /
+        ISS_EARTH_RADIUS_KM
+      );
+
+  point.zER =
+      (float)(
+        zKm /
+        ISS_EARTH_RADIUS_KM
+      );
+
+  return true;
+}
+
+static bool propagateISSAt(
+  time_t utc,
+  float &latDeg,
+  float &lonDeg,
+  ISSSpacePoint *spacePoint = nullptr
+) {
+  if (
+    !ensureISSPredictor()
+  ) {
+    return false;
+  }
+
+  P13DateTime dt;
+
+  if (
+    !makeP13UTC(
+      utc,
+      dt
+    )
+  ) {
+    return false;
+  }
+
+  double lat = 0.0;
+  double lon = 0.0;
+
+  issPredictor->predict(dt);
+  issPredictor->latlon(
+    lat,
+    lon
+  );
+
+  if (
+    !isfinite(lat) ||
+    !isfinite(lon)
+  ) {
+    return false;
+  }
+
+  if (
+    spacePoint &&
+    !readISSSpacePoint(
+      *spacePoint
+    )
+  ) {
+    return false;
+  }
+
+  latDeg =
+      (float)lat;
+
+  lonDeg =
+      (float)lon;
+
+  return true;
+}
+
+static bool rebuildISSOrbit(
+  time_t nowUTC
+) {
+  if (
+    !ensureISSPredictor()
+  ) {
+    return false;
+  }
+
+  P13DateTime baseTime;
+
+  if (
+    !makeP13UTC(
+      nowUTC,
+      baseTime
+    )
+  ) {
+    return false;
+  }
+
+  const uint8_t inactive =
+      (uint8_t)(
+        1u -
+        issOrbitActiveBuffer
+      );
+
+  ISSSpacePoint *dst =
+      issOrbitBuffers[
+        inactive
+      ];
+
+  for (
+    uint16_t i = 0;
+    i < ISS_ORBIT_POINT_COUNT;
+    ++i
+  ) {
+    const int32_t offsetSec =
+        -ISS_ORBIT_HALF_WINDOW_SEC +
+        (int32_t)i *
+        ISS_ORBIT_STEP_SEC;
+
+    P13DateTime sampleTime(
+      baseTime
+    );
+
+    sampleTime.add(
+      (double)offsetSec /
+      86400.0
+    );
+
+    issPredictor->predict(
+      sampleTime
+    );
+
+    if (
+      !readISSSpacePoint(
+        dst[i]
+      )
+    ) {
+      return false;
+    }
+  }
+
+  portENTER_CRITICAL(
+    &issRenderMux
+  );
+
+  issOrbitActiveBuffer =
+      inactive;
+
+  issOrbitValid =
+      true;
+
+  portEXIT_CRITICAL(
+    &issRenderMux
+  );
+
+  if (!issFirstOrbitLogDone) {
+    issFirstOrbitLogDone = true;
+
+    Serial.printf(
+      "[ISS] 3D orbit cache ready: %u points, %+ld..%+ld min\n",
+      (unsigned)ISS_ORBIT_POINT_COUNT,
+      (long)(
+        -ISS_ORBIT_HALF_WINDOW_SEC /
+        60
+      ),
+      (long)(
+        ISS_ORBIT_HALF_WINDOW_SEC /
+        60
+      )
+    );
+  }
+
+  return true;
+}
+
+static bool ensureISSObserver() {
+  if (
+    !appConfig.enableISS ||
+    !appConfig.observerConfigured
+  ) {
+    return false;
+  }
+
+  if (issObserver)
+    return true;
+
+  issObserver =
+      new (std::nothrow)
+      P13Observer(
+        "GLOBE",
+        appConfig.observerLatDeg,
+        appConfig.observerLonDeg,
+        appConfig.observerAltM
+      );
+
+  if (!issObserver) {
+    Serial.println(
+      "[ISS OBS] Observer allocation failed"
+    );
+
+    return false;
+  }
+
+  Serial.println(
+    "[ISS OBS] Observer ready"
+  );
+
+  return true;
+}
+
+// True while the ISS is outside Earth's full umbra.
+//
+// This uses a finite-Sun conical umbra rather than an infinite cylindrical
+// shadow. Penumbra is intentionally treated as sunlit; for LEO the partial
+// phase is brief and this keeps the visible/not-visible state useful and
+// stable on the 7-second display cadence.
+static bool isISSXYZSunlit(
+  double px,
+  double py,
+  double pz,
+  double sx,
+  double sy,
+  double sz
+) {
+  const double axialDot =
+      px * sx +
+      py * sy +
+      pz * sz;
+
+  // Sunward side of Earth cannot be in Earth's umbra.
+  if (axialDot >= 0.0)
+    return true;
+
+  const double behindEarthKm =
+      -axialDot;
+
+  const double umbraLengthKm =
+      SUN_MEAN_DISTANCE_KM *
+      ISS_EARTH_RADIUS_KM /
+      (
+        SUN_RADIUS_KM -
+        ISS_EARTH_RADIUS_KM
+      );
+
+  if (
+    behindEarthKm >=
+    umbraLengthKm
+  ) {
+    return true;
+  }
+
+  const double radius2 =
+      px * px +
+      py * py +
+      pz * pz;
+
+  double perpendicular2 =
+      radius2 -
+      axialDot * axialDot;
+
+  if (perpendicular2 < 0.0)
+    perpendicular2 = 0.0;
+
+  const double umbraRadiusKm =
+      ISS_EARTH_RADIUS_KM *
+      (
+        1.0 -
+        behindEarthKm /
+        umbraLengthKm
+      );
+
+  return
+      perpendicular2 >=
+      umbraRadiusKm *
+      umbraRadiusKm;
+}
+
+static bool currentISSIsSunlit() {
+  if (!issPredictor)
+    return false;
+
+  return
+      isISSXYZSunlit(
+        issPredictor->c_vecS[0],
+        issPredictor->c_vecS[1],
+        issPredictor->c_vecS[2],
+        issVisibilitySun.c_vecH[0],
+        issVisibilitySun.c_vecH[1],
+        issVisibilitySun.c_vecH[2]
+      );
+}
+
+static void updateISSObserverStatus(
+  time_t nowUTC
+) {
+  if (
+    !ensureISSObserver() ||
+    !issPredictor
+  ) {
+    portENTER_CRITICAL(
+      &issRenderMux
+    );
+
+    issObserverStatusValid =
+        false;
+
+    portEXIT_CRITICAL(
+      &issRenderMux
+    );
+
+    return;
+  }
+
+  // IMPORTANT: caller invokes this immediately after propagateISSAt(nowUTC),
+  // before rebuildISSOrbit() advances the shared predictor through +/-60 min.
+  double elevationDeg = 0.0;
+  double azimuthDeg = 0.0;
+
+  issPredictor->elaz(
+    *issObserver,
+    elevationDeg,
+    azimuthDeg
+  );
+
+  const double dx =
+      issPredictor->c_vecS[0] -
+      issObserver->c_vecO[0];
+
+  const double dy =
+      issPredictor->c_vecS[1] -
+      issObserver->c_vecO[1];
+
+  const double dz =
+      issPredictor->c_vecS[2] -
+      issObserver->c_vecO[2];
+
+  const double rangeKm =
+      sqrt(
+        dx * dx +
+        dy * dy +
+        dz * dz
+      );
+
+  P13DateTime sunTime;
+
+  if (
+    !makeP13UTC(
+      nowUTC,
+      sunTime
+    )
+  ) {
+    return;
+  }
+
+  issVisibilitySun.predict(
+    sunTime
+  );
+
+  double observerSunElevationDeg = 0.0;
+  double observerSunAzimuthDeg = 0.0;
+
+  issVisibilitySun.elaz(
+    *issObserver,
+    observerSunElevationDeg,
+    observerSunAzimuthDeg
+  );
+
+  const bool sunlit =
+      currentISSIsSunlit();
+
+  const bool above =
+      elevationDeg > 0.0;
+
+  const bool visible =
+      elevationDeg >=
+        appConfig.visibleMinElevationDeg &&
+      observerSunElevationDeg <=
+        appConfig.visibleSunMaxElevationDeg &&
+      sunlit;
+
+  portENTER_CRITICAL(
+    &issRenderMux
+  );
+
+  issObserverElevationDeg =
+      (float)elevationDeg;
+
+  issObserverAzimuthDeg =
+      (float)azimuthDeg;
+
+  issObserverRangeKm =
+      (float)rangeKm;
+
+  issObserverSunElevationDeg =
+      (float)observerSunElevationDeg;
+
+  issAboveHorizon =
+      above;
+
+  issSunlit =
+      sunlit;
+
+  issOpticallyVisible =
+      visible;
+
+  issObserverStatusValid =
+      true;
+
+  portEXIT_CRITICAL(
+    &issRenderMux
+  );
+
+  // Log state changes immediately, plus a 30-second heartbeat while above the
+  // horizon so hardware testing is easy without flooding Serial all day.
+  const uint32_t nowMs =
+      millis();
+
+  const bool changed =
+      !lastLoggedObserverValid ||
+      above !=
+        lastLoggedAboveHorizon ||
+      visible !=
+        lastLoggedVisible ||
+      sunlit !=
+        lastLoggedSunlit;
+
+  const bool heartbeat =
+      above &&
+      (
+        nowMs -
+        lastObserverStatusLogMs >=
+        30000
+      );
+
+  if (
+    changed ||
+    heartbeat
+  ) {
+    lastLoggedObserverValid =
+        true;
+
+    lastLoggedAboveHorizon =
+        above;
+
+    lastLoggedVisible =
+        visible;
+
+    lastLoggedSunlit =
+        sunlit;
+
+    lastObserverStatusLogMs =
+        nowMs;
+
+    Serial.printf(
+      "[ISS OBS] EL=%.1f AZ=%.1f RANGE=%.0fkm SUN=%.1f ISS_SUN=%u ABOVE=%u VISIBLE=%u\n",
+      elevationDeg,
+      azimuthDeg,
+      rangeKm,
+      observerSunElevationDeg,
+      sunlit ? 1u : 0u,
+      above ? 1u : 0u,
+      visible ? 1u : 0u
+    );
+  }
+}
+
+static bool evaluateISSForecastState(
+  P13Satellite &satellite,
+  P13Observer &observer,
+  P13Sun &sun,
+  time_t utc,
+  double &elevationDeg,
+  bool &visible
+) {
+  P13DateTime dt;
+
+  if (
+    !makeP13UTC(
+      utc,
+      dt
+    )
+  ) {
+    return false;
+  }
+
+  satellite.predict(
+    dt
+  );
+
+  double azimuthDeg = 0.0;
+
+  satellite.elaz(
+    observer,
+    elevationDeg,
+    azimuthDeg
+  );
+
+  sun.predict(
+    dt
+  );
+
+  double sunElevationDeg = 0.0;
+  double sunAzimuthDeg = 0.0;
+
+  sun.elaz(
+    observer,
+    sunElevationDeg,
+    sunAzimuthDeg
+  );
+
+  const bool sunlit =
+      isISSXYZSunlit(
+        satellite.c_vecS[0],
+        satellite.c_vecS[1],
+        satellite.c_vecS[2],
+        sun.c_vecH[0],
+        sun.c_vecH[1],
+        sun.c_vecH[2]
+      );
+
+  visible =
+      elevationDeg >=
+        appConfig.visibleMinElevationDeg &&
+      sunElevationDeg <=
+        appConfig.visibleSunMaxElevationDeg &&
+      sunlit;
+
+  return
+      isfinite(
+        elevationDeg
+      ) &&
+      isfinite(
+        sunElevationDeg
+      );
+}
+
+static time_t refineISSForecastTransition(
+  P13Satellite &satellite,
+  P13Observer &observer,
+  P13Sun &sun,
+  time_t lowUTC,
+  time_t highUTC,
+  bool visibleTransition
+) {
+  // Caller guarantees:
+  //   low  = predicate false
+  //   high = predicate true
+  //
+  // Six bisections turn a 60-second coarse interval into ~1-second timing.
+  for (
+    uint8_t i = 0;
+    i < 6;
+    ++i
+  ) {
+    if (
+      highUTC -
+      lowUTC <= 1
+    ) {
+      break;
+    }
+
+    const time_t midUTC =
+        lowUTC +
+        (
+          highUTC -
+          lowUTC
+        ) /
+        2;
+
+    double elevationDeg = -90.0;
+    bool visible = false;
+
+    if (
+      !evaluateISSForecastState(
+        satellite,
+        observer,
+        sun,
+        midUTC,
+        elevationDeg,
+        visible
+      )
+    ) {
+      break;
+    }
+
+    const bool predicate =
+        visibleTransition ?
+        visible :
+        elevationDeg > 0.0;
+
+    if (predicate) {
+      highUTC =
+          midUTC;
+    }
+    else {
+      lowUTC =
+          midUTC;
+    }
+  }
+
+  return
+      highUTC;
+}
+
+static float computeISSPassMaxElevationAroundTime(
+  P13Satellite &satellite,
+  P13Observer &observer,
+  time_t eventUTC
+) {
+  if (eventUTC < 1700000000)
+    return -1.0f;
+
+  // ISS horizon-to-horizon passes are much shorter than this window and
+  // successive passes are ~90 minutes apart, so +/-20 minutes safely captures
+  // the complete pass containing the visible event.
+  constexpr int32_t SPAN_SEC =
+      20 * 60;
+
+  constexpr int32_t COARSE_STEP_SEC =
+      10;
+
+  float bestElevation =
+      -90.0f;
+
+  time_t bestUTC = 0;
+
+  for (
+    int32_t offset =
+        -SPAN_SEC;
+    offset <=
+        SPAN_SEC;
+    offset +=
+        COARSE_STEP_SEC
+  ) {
+    const time_t sampleUTC =
+        eventUTC +
+        offset;
+
+    P13DateTime dt;
+
+    if (
+      !makeP13UTC(
+        sampleUTC,
+        dt
+      )
+    ) {
+      continue;
+    }
+
+    satellite.predict(
+      dt
+    );
+
+    double elevationDeg = -90.0;
+    double azimuthDeg = 0.0;
+
+    satellite.elaz(
+      observer,
+      elevationDeg,
+      azimuthDeg
+    );
+
+    if (
+      isfinite(
+        elevationDeg
+      ) &&
+      elevationDeg >
+        bestElevation
+    ) {
+      bestElevation =
+          (float)elevationDeg;
+
+      bestUTC =
+          sampleUTC;
+    }
+  }
+
+  if (bestUTC == 0)
+    return -1.0f;
+
+  // Refine +/-10 seconds around the best coarse sample at one-second spacing.
+  for (
+    int32_t offset = -10;
+    offset <= 10;
+    ++offset
+  ) {
+    const time_t sampleUTC =
+        bestUTC +
+        offset;
+
+    P13DateTime dt;
+
+    if (
+      !makeP13UTC(
+        sampleUTC,
+        dt
+      )
+    ) {
+      continue;
+    }
+
+    satellite.predict(
+      dt
+    );
+
+    double elevationDeg = -90.0;
+    double azimuthDeg = 0.0;
+
+    satellite.elaz(
+      observer,
+      elevationDeg,
+      azimuthDeg
+    );
+
+    if (
+      isfinite(
+        elevationDeg
+      ) &&
+      elevationDeg >
+        bestElevation
+    ) {
+      bestElevation =
+          (float)elevationDeg;
+    }
+  }
+
+  if (bestElevation > 90.0f)
+    bestElevation = 90.0f;
+
+  return
+      bestElevation;
+}
+
+
+static bool refreshISSUpcomingForecast() {
+  if (
+    !appConfig.enableISS ||
+    !appConfig.observerConfigured ||
+    !haveISSTLE
+  ) {
+    return false;
+  }
+
+  const time_t nowUTC =
+      time(nullptr);
+
+  if (nowUTC < 1700000000)
+    return false;
+
+  issUpcomingForecastBusy =
+      true;
+
+  Serial.println(
+    "[ISS FORECAST] Calculating..."
+  );
+
+  // Independent objects: this long scan cannot move the live ISS glyph,
+  // observer state, day/night state, or the +/-60 minute orbit cache.
+  P13Satellite forecastSatellite(
+    issTLEName,
+    issTLELine1,
+    issTLELine2
+  );
+
+  P13Observer forecastObserver(
+    "FORECAST",
+    appConfig.observerLatDeg,
+    appConfig.observerLonDeg,
+    appConfig.observerAltM
+  );
+
+  P13Sun forecastSun;
+
+  double previousElevationDeg = -90.0;
+  bool previousVisible = false;
+
+  if (
+    !evaluateISSForecastState(
+      forecastSatellite,
+      forecastObserver,
+      forecastSun,
+      nowUTC,
+      previousElevationDeg,
+      previousVisible
+    )
+  ) {
+    issUpcomingForecastBusy =
+        false;
+
+    return false;
+  }
+
+  bool previousAbove =
+      previousElevationDeg > 0.0;
+
+  // If calculation begins during an existing pass/visible interval, skip that
+  // current event and report the NEXT one.
+  bool passArmed =
+      !previousAbove;
+
+  bool visibleArmed =
+      !previousVisible;
+
+  time_t nextPassUTC = 0;
+  time_t nextVisibleUTC = 0;
+
+  time_t previousUTC =
+      nowUTC;
+
+  uint32_t sampleCount = 0;
+
+  for (
+    int32_t offsetSec =
+        ISS_UPCOMING_FORECAST_STEP_SEC;
+    offsetSec <=
+        ISS_UPCOMING_FORECAST_MAX_SEC;
+    offsetSec +=
+        ISS_UPCOMING_FORECAST_STEP_SEC
+  ) {
+    const time_t sampleUTC =
+        nowUTC +
+        offsetSec;
+
+    double elevationDeg = -90.0;
+    bool visible = false;
+
+    if (
+      !evaluateISSForecastState(
+        forecastSatellite,
+        forecastObserver,
+        forecastSun,
+        sampleUTC,
+        elevationDeg,
+        visible
+      )
+    ) {
+      previousUTC =
+          sampleUTC;
+
+      continue;
+    }
+
+    const bool above =
+        elevationDeg > 0.0;
+
+    if (!passArmed) {
+      if (!above) {
+        passArmed =
+            true;
+      }
+    }
+    else if (
+      nextPassUTC == 0 &&
+      !previousAbove &&
+      above
+    ) {
+      nextPassUTC =
+          refineISSForecastTransition(
+            forecastSatellite,
+            forecastObserver,
+            forecastSun,
+            previousUTC,
+            sampleUTC,
+            false
+          );
+
+      // Publish the ordinary geometric pass immediately.  Finding the next
+      // naked-eye-visible pass can require scanning days farther into the
+      // future; the OLED should not hide a pass we already know about while
+      // that longer search continues.  Busy intentionally remains true, so
+      // NEXT VISIBLE can continue to display CALCULATING.
+      if (nextPassUTC != 0) {
+        portENTER_CRITICAL(
+          &issRenderMux
+        );
+
+        issNextPassUTC =
+            nextPassUTC;
+
+        issNextVisibleUTC = 0;
+        issNextVisibleMaxElevationDeg = -1.0f;
+
+        issUpcomingForecastComputedUTC =
+            nowUTC;
+
+        issUpcomingForecastValid =
+            true;
+
+        portEXIT_CRITICAL(
+          &issRenderMux
+        );
+
+        Serial.printf(
+          "[ISS FORECAST] NEXT PASS=%lld published; continuing visible search\n",
+          (long long)nextPassUTC
+        );
+      }
+    }
+
+    if (!visibleArmed) {
+      if (!visible) {
+        visibleArmed =
+            true;
+      }
+    }
+    else if (
+      nextVisibleUTC == 0 &&
+      !previousVisible &&
+      visible
+    ) {
+      nextVisibleUTC =
+          refineISSForecastTransition(
+            forecastSatellite,
+            forecastObserver,
+            forecastSun,
+            previousUTC,
+            sampleUTC,
+            true
+          );
+    }
+
+    previousAbove =
+        above;
+
+    previousVisible =
+        visible;
+
+    previousElevationDeg =
+        elevationDeg;
+
+    previousUTC =
+        sampleUTC;
+
+    ++sampleCount;
+
+    // This is a background calculation on a single-core ESP32-S2.  Yield every
+    // 32 coarse samples so rendering and network housekeeping stay responsive
+    // without unnecessarily stretching the forecast calculation.
+    if (
+      (
+        sampleCount &
+        0x1Fu
+      ) == 0
+    ) {
+      vTaskDelay(
+        pdMS_TO_TICKS(1)
+      );
+    }
+
+    if (
+      nextPassUTC != 0 &&
+      nextVisibleUTC != 0
+    ) {
+      break;
+    }
+  }
+
+  float nextVisibleMaxEl = -1.0f;
+
+  if (
+    nextVisibleUTC != 0
+  ) {
+    nextVisibleMaxEl =
+        computeISSPassMaxElevationAroundTime(
+          forecastSatellite,
+          forecastObserver,
+          nextVisibleUTC
+        );
+  }
+
+  portENTER_CRITICAL(
+    &issRenderMux
+  );
+
+  issNextPassUTC =
+      nextPassUTC;
+
+  issNextVisibleUTC =
+      nextVisibleUTC;
+
+  issNextVisibleMaxElevationDeg =
+      nextVisibleMaxEl;
+
+  issUpcomingForecastComputedUTC =
+      nowUTC;
+
+  issUpcomingForecastValid =
+      true;
+
+  issUpcomingForecastBusy =
+      false;
+
+  portEXIT_CRITICAL(
+    &issRenderMux
+  );
+
+  Serial.printf(
+    "[ISS FORECAST] PASS=%lld VISIBLE=%lld VMAX=%.1f samples=%u\n",
+    (long long)nextPassUTC,
+    (long long)nextVisibleUTC,
+    (double)nextVisibleMaxEl,
+    (unsigned)sampleCount
+  );
+
+  return true;
+}
+
+static void serviceISSUpcomingForecast() {
+  if (
+    !appConfig.enableISS ||
+    !appConfig.observerConfigured ||
+    !haveISSTLE
+  ) {
+    return;
+  }
+
+  const time_t nowUTC =
+      time(nullptr);
+
+  if (nowUTC < 1700000000)
+    return;
+
+  bool valid = false;
+  time_t nextPassUTC = 0;
+  time_t nextVisibleUTC = 0;
+  time_t computedUTC = 0;
+
+  portENTER_CRITICAL(
+    &issRenderMux
+  );
+
+  valid =
+      issUpcomingForecastValid;
+
+  nextPassUTC =
+      issNextPassUTC;
+
+  nextVisibleUTC =
+      issNextVisibleUTC;
+
+  computedUTC =
+      issUpcomingForecastComputedUTC;
+
+  portEXIT_CRITICAL(
+    &issRenderMux
+  );
+
+  bool refresh =
+      !valid;
+
+  // "NEXT" means strictly future.  As soon as a predicted event starts, retire
+  // it and calculate the following event.  The old code retained an event for
+  // 20 minutes after its onset, which could make a 22:45 forecast still show
+  // a 22:40 pass.
+  //
+  // A small 5-second tolerance avoids needless recalculation from one-second
+  // forecast-refinement jitter around the transition itself.
+  constexpr time_t FORECAST_RETIRE_TOLERANCE_SEC =
+      5;
+
+  if (
+    nextPassUTC != 0 &&
+    nowUTC >=
+      nextPassUTC +
+      FORECAST_RETIRE_TOLERANCE_SEC
+  ) {
+    refresh =
+        true;
+  }
+
+  if (
+    nextVisibleUTC != 0 &&
+    nowUTC >=
+      nextVisibleUTC +
+      FORECAST_RETIRE_TOLERANCE_SEC
+  ) {
+    refresh =
+        true;
+  }
+
+  // If no visible event was found inside the 14-day search horizon, or simply
+  // to keep an old forecast current, retry every six hours.
+  if (
+    computedUTC == 0 ||
+    nowUTC -
+      computedUTC >=
+      6 * 60 * 60
+  ) {
+    refresh =
+        true;
+  }
+
+  if (refresh) {
+    refreshISSUpcomingForecast();
+  }
+}
+
+
+static float observerElevationForER(
+  float xER,
+  float yER,
+  float zER
+) {
+  if (!issObserver)
+    return -90.0f;
+
+  const double xKm =
+      (double)xER *
+      ISS_EARTH_RADIUS_KM;
+
+  const double yKm =
+      (double)yER *
+      ISS_EARTH_RADIUS_KM;
+
+  const double zKm =
+      (double)zER *
+      ISS_EARTH_RADIUS_KM;
+
+  double rx =
+      xKm -
+      issObserver->c_vecO[0];
+
+  double ry =
+      yKm -
+      issObserver->c_vecO[1];
+
+  double rz =
+      zKm -
+      issObserver->c_vecO[2];
+
+  const double rangeKm =
+      sqrt(
+        rx * rx +
+        ry * ry +
+        rz * rz
+      );
+
+  if (
+    !isfinite(rangeKm) ||
+    rangeKm <= 0.0
+  ) {
+    return -90.0f;
+  }
+
+  rx /= rangeKm;
+  ry /= rangeKm;
+  rz /= rangeKm;
+
+  double up =
+      rx *
+      issObserver->c_vecU[0] +
+      ry *
+      issObserver->c_vecU[1] +
+      rz *
+      issObserver->c_vecU[2];
+
+  if (up > 1.0)
+    up = 1.0;
+
+  if (up < -1.0)
+    up = -1.0;
+
+  return
+      (float)degrees(
+        asin(up)
+      );
+}
+
+// Refine a current-pass optical visibility loss.  The caller supplies a
+// low endpoint that is visible and a high endpoint that is not visible.
+static time_t refineISSVisibilityEndTransition(
+  P13Satellite &satellite,
+  P13Observer &observer,
+  P13Sun &sun,
+  time_t lowUTC,
+  time_t highUTC
+) {
+  for (
+    uint8_t i = 0;
+    i < 6;
+    ++i
+  ) {
+    if (
+      highUTC -
+      lowUTC <= 1
+    ) {
+      break;
+    }
+
+    const time_t midUTC =
+        lowUTC +
+        (
+          highUTC -
+          lowUTC
+        ) /
+        2;
+
+    double elevationDeg = -90.0;
+    bool visible = false;
+
+    if (
+      !evaluateISSForecastState(
+        satellite,
+        observer,
+        sun,
+        midUTC,
+        elevationDeg,
+        visible
+      )
+    ) {
+      break;
+    }
+
+    if (visible) {
+      lowUTC =
+          midUTC;
+    }
+    else {
+      highUTC =
+          midUTC;
+    }
+  }
+
+  return
+      highUTC;
+}
+
+
+// Predict the end of the CURRENT optical visibility interval.  This uses
+// independent AioP13 objects so it cannot disturb the live globe propagator.
+// It is called only when a new visible interval needs a cached end time.
+static time_t predictISSCurrentVisibleEndUTC(
+  time_t nowUTC,
+  time_t predictedSetUTC
+) {
+  if (
+    predictedSetUTC <=
+      nowUTC ||
+    !haveISSTLE ||
+    !appConfig.observerConfigured
+  ) {
+    return 0;
+  }
+
+  P13Satellite satellite(
+    issTLEName,
+    issTLELine1,
+    issTLELine2
+  );
+
+  P13Observer observer(
+    "PASS END",
+    appConfig.observerLatDeg,
+    appConfig.observerLonDeg,
+    appConfig.observerAltM
+  );
+
+  P13Sun sun;
+
+  double elevationDeg = -90.0;
+  bool visible = false;
+
+  if (
+    !evaluateISSForecastState(
+      satellite,
+      observer,
+      sun,
+      nowUTC,
+      elevationDeg,
+      visible
+    ) ||
+    !visible
+  ) {
+    return 0;
+  }
+
+  constexpr int32_t VISIBLE_END_STEP_SEC = 5;
+
+  time_t previousUTC =
+      nowUTC;
+
+  // Look slightly beyond the interpolated geometric set so an interval that
+  // remains visible right to the horizon still produces a true->false sample.
+  const time_t scanEndUTC =
+      predictedSetUTC +
+      30;
+
+  for (
+    time_t sampleUTC =
+        nowUTC +
+        VISIBLE_END_STEP_SEC;
+    sampleUTC <=
+      scanEndUTC;
+    sampleUTC +=
+      VISIBLE_END_STEP_SEC
+  ) {
+    if (
+      !evaluateISSForecastState(
+        satellite,
+        observer,
+        sun,
+        sampleUTC,
+        elevationDeg,
+        visible
+      )
+    ) {
+      // Keep previousUTC at the last known-visible sample so the refinement
+      // bracket remains valid if a later sample succeeds.
+      continue;
+    }
+
+    if (!visible) {
+      return
+          refineISSVisibilityEndTransition(
+            satellite,
+            observer,
+            sun,
+            previousUTC,
+            sampleUTC
+          );
+    }
+
+    previousUTC =
+        sampleUTC;
+  }
+
+  return
+      predictedSetUTC;
+}
+
+
+static void updateISSPredictedSet(
+  time_t nowUTC
+) {
+  if (
+    !appConfig.enableISS ||
+    !appConfig.observerConfigured ||
+    !issObserver
+  ) {
+    portENTER_CRITICAL(
+      &issRenderMux
+    );
+
+    issPredictedSetUTC = 0;
+    issCurrentPassMaxElevationDeg = 0.0f;
+    issCurrentPassMaxUTC = 0;
+    issCurrentPassVisibleEndUTC = 0;
+
+    portEXIT_CRITICAL(
+      &issRenderMux
+    );
+
+    return;
+  }
+
+  bool orbitOK = false;
+  bool aboveNow = false;
+  bool visibleNow = false;
+  float currentEl = -90.0f;
+  uint8_t active = 0;
+  time_t cachedVisibleEndUTC = 0;
+
+  portENTER_CRITICAL(
+    &issRenderMux
+  );
+
+  orbitOK =
+      issOrbitValid;
+
+  aboveNow =
+      issAboveHorizon;
+
+  visibleNow =
+      issOpticallyVisible;
+
+  currentEl =
+      issObserverElevationDeg;
+
+  active =
+      issOrbitActiveBuffer;
+
+  cachedVisibleEndUTC =
+      issCurrentPassVisibleEndUTC;
+
+  portEXIT_CRITICAL(
+    &issRenderMux
+  );
+
+  if (
+    !orbitOK ||
+    !aboveNow ||
+    currentEl <= 0.0f
+  ) {
+    portENTER_CRITICAL(
+      &issRenderMux
+    );
+
+    issPredictedSetUTC = 0;
+    issCurrentPassMaxElevationDeg = 0.0f;
+    issCurrentPassMaxUTC = 0;
+    issCurrentPassVisibleEndUTC = 0;
+
+    portEXIT_CRITICAL(
+      &issRenderMux
+    );
+
+    return;
+  }
+
+  // Snapshot the full +/-60 minute cache.  This lets us inspect both the past
+  // and future portions of the CURRENT pass and therefore know its full peak
+  // elevation even after culmination.
+  ISSSpacePoint orbit[
+    ISS_ORBIT_POINT_COUNT
+  ];
+
+  portENTER_CRITICAL(
+    &issRenderMux
+  );
+
+  for (
+    uint16_t i = 0;
+    i < ISS_ORBIT_POINT_COUNT;
+    ++i
+  ) {
+    orbit[i] =
+        issOrbitBuffers[
+          active
+        ][
+          i
+        ];
+  }
+
+  portEXIT_CRITICAL(
+    &issRenderMux
+  );
+
+  float elevations[
+    ISS_ORBIT_POINT_COUNT
+  ];
+
+  for (
+    uint16_t i = 0;
+    i < ISS_ORBIT_POINT_COUNT;
+    ++i
+  ) {
+    elevations[i] =
+        observerElevationForER(
+          orbit[i].xER,
+          orbit[i].yER,
+          orbit[i].zER
+        );
+  }
+
+  uint16_t passStart =
+      ISS_ORBIT_NOW_INDEX;
+
+  while (
+    passStart > 0 &&
+    elevations[
+      passStart - 1
+    ] > 0.0f
+  ) {
+    --passStart;
+  }
+
+  uint16_t passEnd =
+      ISS_ORBIT_NOW_INDEX;
+
+  while (
+    passEnd + 1 <
+      ISS_ORBIT_POINT_COUNT &&
+    elevations[
+      passEnd + 1
+    ] > 0.0f
+  ) {
+    ++passEnd;
+  }
+
+  float predictedMaxEl =
+      currentEl;
+
+  uint16_t maxIndex =
+      ISS_ORBIT_NOW_INDEX;
+
+  for (
+    uint16_t i = passStart;
+    i <= passEnd;
+    ++i
+  ) {
+    if (
+      elevations[i] >
+      predictedMaxEl
+    ) {
+      predictedMaxEl =
+          elevations[i];
+
+      maxIndex =
+          i;
+    }
+  }
+
+  // Fractional offset from the best coarse sample to the parabolic vertex.
+  // This gives us both a better peak elevation and a useful MAX IN timestamp.
+  float peakFraction = 0.0f;
+
+  // Refine the coarse 45-second peak with a simple parabolic interpolation
+  // through the neighbouring elevations. This is particularly useful for
+  // deciding whether a high pass crosses the 60-degree "great pass" threshold.
+  if (
+    maxIndex > passStart &&
+    maxIndex < passEnd
+  ) {
+    const float a =
+        elevations[
+          maxIndex - 1
+        ];
+
+    const float b =
+        elevations[
+          maxIndex
+        ];
+
+    const float c =
+        elevations[
+          maxIndex + 1
+        ];
+
+    const float curvature =
+        a -
+        2.0f * b +
+        c;
+
+    if (
+      curvature <
+      -0.0001f
+    ) {
+      const float vertexFraction =
+          (a - c) /
+          (
+            2.0f *
+            curvature
+          );
+
+      const float interpolatedPeak =
+          b -
+          (
+            (a - c) *
+            (a - c)
+          ) /
+          (
+            8.0f *
+            curvature
+          );
+
+      if (
+        isfinite(
+          vertexFraction
+        ) &&
+        vertexFraction >=
+          -1.0f &&
+        vertexFraction <=
+          1.0f
+      ) {
+        peakFraction =
+            vertexFraction;
+      }
+
+      if (
+        isfinite(
+          interpolatedPeak
+        ) &&
+        interpolatedPeak >
+          predictedMaxEl &&
+        interpolatedPeak <=
+          90.0f
+      ) {
+        predictedMaxEl =
+            interpolatedPeak;
+      }
+    }
+  }
+
+  const double maxOffsetSec =
+      (
+        (double)(
+          (int32_t)maxIndex -
+          (int32_t)ISS_ORBIT_NOW_INDEX
+        ) +
+        (double)peakFraction
+      ) *
+      (double)ISS_ORBIT_STEP_SEC;
+
+  const time_t predictedMaxUTC =
+      nowUTC +
+      (time_t)lround(
+        maxOffsetSec
+      );
+
+  // Find the future EL=0 crossing for the SET field.
+  float previousEl =
+      currentEl;
+
+  int32_t previousOffsetSec =
+      0;
+
+  time_t predictedSet = 0;
+
+  for (
+    uint16_t i =
+        ISS_ORBIT_NOW_INDEX + 1;
+    i < ISS_ORBIT_POINT_COUNT;
+    ++i
+  ) {
+    const int32_t offsetSec =
+        (
+          (int32_t)i -
+          (int32_t)
+          ISS_ORBIT_NOW_INDEX
+        ) *
+        ISS_ORBIT_STEP_SEC;
+
+    const float elevation =
+        elevations[i];
+
+    if (
+      previousEl > 0.0f &&
+      elevation <= 0.0f
+    ) {
+      float fraction = 0.0f;
+
+      const float denominator =
+          previousEl -
+          elevation;
+
+      if (
+        fabsf(denominator) >
+        0.0001f
+      ) {
+        fraction =
+            previousEl /
+            denominator;
+      }
+
+      if (fraction < 0.0f)
+        fraction = 0.0f;
+
+      if (fraction > 1.0f)
+        fraction = 1.0f;
+
+      const double interpolatedOffset =
+          (double)previousOffsetSec +
+          (
+            (double)(
+              offsetSec -
+              previousOffsetSec
+            ) *
+            fraction
+          );
+
+      predictedSet =
+          nowUTC +
+          (time_t)lround(
+            interpolatedOffset
+          );
+
+      break;
+    }
+
+    previousEl =
+        elevation;
+
+    previousOffsetSec =
+        offsetSec;
+  }
+
+  time_t predictedVisibleEndUTC =
+      cachedVisibleEndUTC;
+
+  if (visibleNow) {
+    const bool needVisibleEndPrediction =
+        predictedVisibleEndUTC <=
+          nowUTC ||
+        (
+          predictedSet != 0 &&
+          predictedVisibleEndUTC >
+            predictedSet +
+            30
+        );
+
+    if (needVisibleEndPrediction) {
+      predictedVisibleEndUTC =
+          predictISSCurrentVisibleEndUTC(
+            nowUTC,
+            predictedSet
+          );
+    }
+  }
+  else if (
+    predictedVisibleEndUTC <=
+      nowUTC
+  ) {
+    predictedVisibleEndUTC = 0;
+  }
+
+  portENTER_CRITICAL(
+    &issRenderMux
+  );
+
+  issPredictedSetUTC =
+      predictedSet;
+
+  issCurrentPassMaxElevationDeg =
+      predictedMaxEl;
+
+  issCurrentPassMaxUTC =
+      predictedMaxUTC;
+
+  issCurrentPassVisibleEndUTC =
+      predictedVisibleEndUTC;
+
+  portEXIT_CRITICAL(
+    &issRenderMux
+  );
+}
+
+
+static void serviceISSPropagation(
+  bool forceOrbitBuild
+) {
+  if (
+    !appConfig.enableISS ||
+    !haveISSTLE
+  ) {
+    return;
+  }
+
+  const time_t nowUTC =
+      time(nullptr);
+
+  if (nowUTC < 1700000000)
+    return;
+
+  float lat = 0.0f;
+  float lon = 0.0f;
+
+  ISSSpacePoint currentPoint;
+
+  if (
+    propagateISSAt(
+      nowUTC,
+      lat,
+      lon,
+      &currentPoint
+    )
+  ) {
+    portENTER_CRITICAL(
+      &issRenderMux
+    );
+
+    issCurrentXER =
+        currentPoint.xER;
+
+    issCurrentYER =
+        currentPoint.yER;
+
+    issCurrentZER =
+        currentPoint.zER;
+
+    issCurrentLatDeg =
+        lat;
+
+    issCurrentLonDeg =
+        lon;
+
+    issPositionValid =
+        true;
+
+    portEXIT_CRITICAL(
+      &issRenderMux
+    );
+
+    updateISSObserverStatus(
+      nowUTC
+    );
+  }
+
+  const uint32_t nowMs =
+      millis();
+
+  if (
+    forceOrbitBuild ||
+    !issOrbitValid ||
+    issLastOrbitBuildMillis == 0 ||
+    nowMs -
+      issLastOrbitBuildMillis >=
+      ISS_ORBIT_REBUILD_INTERVAL_MS
+  ) {
+    if (
+      rebuildISSOrbit(
+        nowUTC
+      )
+    ) {
+      issLastOrbitBuildMillis =
+          nowMs;
+
+      updateISSPredictedSet(
+        nowUTC
+      );
+
+      Serial.printf(
+        "[ISS] Position lat=%.3f lon=%.3f\n",
+        (double)lat,
+        (double)lon
+      );
+    }
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -3074,6 +8280,23 @@ static void buttonTask(
 
         longReported =
             false;
+
+        // Every real button press also requests 30 seconds of the ISS forecast
+        // page.  Cloud replay gesture recognition continues independently.
+        portENTER_CRITICAL(
+          &buttonCommandMux
+        );
+
+        pendingISSOLEDManualForecast =
+            true;
+
+        portEXIT_CRITICAL(
+          &buttonCommandMux
+        );
+
+        Serial.println(
+          "[BUTTON] ISS forecast OLED requested"
+        );
       }
       else {
         // A released short press becomes one click.
@@ -3530,6 +8753,26 @@ static void weatherTask(void *parameter) {
       millis() -
       UPDATE_INTERVAL_MS;
 
+  lastISSServiceMillis =
+      millis();
+
+  lastISSPropagationMillis =
+      millis() -
+      ISS_POSITION_INTERVAL_MS;
+
+  // Do not make the first upcoming-pass forecast wait for the normal 60-second
+  // service cadence.  As soon as UTC/TLE/observer data are valid, the loop
+  // below will calculate it before any archive gap repair work.
+  lastISSUpcomingForecastServiceMs = 0;
+
+  // Build the initial current position + orbit as soon as the background task
+  // starts. No network access occurs here.
+  if (appConfig.enableISS) {
+    serviceISSPropagation(
+      true
+    );
+  }
+
   while (true) {
     if (
       replayActive ||
@@ -3545,7 +8788,69 @@ static void weatherTask(void *parameter) {
     const uint32_t nowMs =
         millis();
 
+    // Highest-priority background job: publish the first NEXT ISS forecast as
+    // soon as UTC is valid, then service forecast retirement/refresh at the
+    // normal cadence.  A missing forecast must never sit behind SD gap repair.
     if (
+      appConfig.enableISS &&
+      appConfig.observerConfigured &&
+      haveISSTLE &&
+      time(nullptr) >= 1700000000 &&
+      (
+        !issUpcomingForecastValid ||
+        nowMs -
+          lastISSUpcomingForecastServiceMs >=
+          ISS_UPCOMING_FORECAST_SERVICE_MS
+      )
+    ) {
+      lastISSUpcomingForecastServiceMs =
+          nowMs;
+
+      serviceISSUpcomingForecast();
+    }
+
+    if (
+      appConfig.enableISS &&
+      nowMs -
+      lastISSServiceMillis >=
+        ISS_SERVICE_INTERVAL_MS
+    ) {
+      lastISSServiceMillis =
+          nowMs;
+
+      if (
+        !replayActive &&
+        !replayStartPending &&
+        workMutex &&
+        xSemaphoreTake(
+          workMutex,
+          portMAX_DELAY
+        ) == pdTRUE
+      ) {
+        serviceISSTLE(false);
+
+        xSemaphoreGive(
+          workMutex
+        );
+      }
+    }
+
+    if (
+      appConfig.enableISS &&
+      nowMs -
+      lastISSPropagationMillis >=
+        ISS_POSITION_INTERVAL_MS
+    ) {
+      lastISSPropagationMillis =
+          nowMs;
+
+      serviceISSPropagation(
+        false
+      );
+    }
+
+    if (
+      appConfig.enableClouds &&
       nowMs -
       lastUpdateMillis >=
         UPDATE_INTERVAL_MS
@@ -3567,6 +8872,9 @@ static void weatherTask(void *parameter) {
           portMAX_DELAY
         ) == pdTRUE
       ) {
+        // Try the network before allocating/using the PNG decoder.  TLS on the
+        // ESP32-S2 is constrained by internal DRAM; the SD bootstrap remains the
+        // fallback, but should not consume resources before the first handshake.
         availabilityOK =
             fetchNSMCAvailability();
 
@@ -3586,18 +8894,16 @@ static void weatherTask(void *parameter) {
       httpBodyBytes = 0;
       httpBodyExpected = -1;
 
-      // Phase 2: compare every officially listed hour with the SD archive.
-      // Failed hours remain absent, therefore remain in the repair queue next
-      // time rather than being silently forgotten.
+      // Phase 2 is now only QUEUED here.  The worker repairs one missing
+      // frame per later turn through the loop, with ISS forecast checks between
+      // every frame, so a large SD backlog can never monopolize this task.
       if (
         availabilityOK &&
         sdReady &&
         !replayActive &&
         !replayStartPending
       ) {
-        // This function now locks one missing frame at a time, so replay can
-        // pre-empt between downloads.
-        repairArchiveGapsFromAvailability();
+        startArchiveGapRepairPass();
       }
 
       vTaskDelay(
@@ -3605,6 +8911,16 @@ static void weatherTask(void *parameter) {
       );
 
       continue;
+    }
+
+    // Lowest-priority background work: repair at most one historical frame on
+    // this loop turn.  The next turn begins again with the ISS forecast check.
+    if (
+      gapRepairPassPending &&
+      !replayActive &&
+      !replayStartPending
+    ) {
+      repairOneArchiveGapFromAvailability();
     }
 
     vTaskDelay(
@@ -3648,7 +8964,243 @@ constexpr size_t FRAME_BYTES =
     FRAME_PIXELS *
     sizeof(uint16_t);
 
-static uint8_t shadeLUT[256];
+static uint8_t *shadeLUT = nullptr;
+
+// Geographic surface-normal lookup tables in Q14 fixed point.
+//
+// Each displayed globe pixel already has an exact geographic latitude row and
+// longitude column from the same reverse-projection map used for Earth/clouds.
+// Use that geography directly for solar illumination.
+static int16_t latitudeSinQ14[EARTH_H];
+static int16_t latitudeCosQ14[EARTH_H];
+static int16_t longitudeSinQ14[EARTH_W];
+static int16_t longitudeCosQ14[EARTH_W];
+
+constexpr int32_t NORMAL_ONE_Q14 = 16384;
+
+// Stronger night level so the day/night split is unmistakable on hardware.
+constexpr uint8_t NIGHT_MIN_BRIGHTNESS = 36;
+
+// Soft civil-twilight-like transition.
+constexpr int16_t TWILIGHT_NIGHT_Q14 = -1713; // sin(-6 deg) * 16384
+constexpr int16_t TWILIGHT_DAY_Q14 = 0;
+
+static P13Sun dayNightSun;
+static time_t cachedSunKeyUTC = 0;
+static bool cachedSunValid = false;
+
+static double cachedSunEarthX = 0.0;
+static double cachedSunEarthY = 0.0;
+static double cachedSunEarthZ = 0.0;
+static bool dayNightFirstLogDone = false;
+
+static bool updateDayNightSun(
+  time_t displayUTC
+) {
+  if (
+    !appConfig.enableDayNight ||
+    displayUTC < 1700000000
+  ) {
+    return false;
+  }
+
+  // Live view only needs a new solar solution every 30 seconds. During replay,
+  // use the exact archived weather timestamp so the terminator travels through
+  // the historical sequence correctly.
+  const time_t keyUTC =
+      replayActive ?
+      displayUTC :
+      (
+        displayUTC -
+        displayUTC % 30
+      );
+
+  if (
+    cachedSunValid &&
+    keyUTC ==
+      cachedSunKeyUTC
+  ) {
+    return true;
+  }
+
+  struct tm t = {};
+
+  if (
+    !gmtime_r(
+      &keyUTC,
+      &t
+    )
+  ) {
+    return false;
+  }
+
+  P13DateTime dt(
+    t.tm_year + 1900,
+    t.tm_mon + 1,
+    t.tm_mday,
+    t.tm_hour,
+    t.tm_min,
+    t.tm_sec
+  );
+
+  dayNightSun.predict(
+    dt
+  );
+
+  cachedSunEarthX =
+      dayNightSun.c_vecH[0];
+
+  cachedSunEarthY =
+      dayNightSun.c_vecH[1];
+
+  cachedSunEarthZ =
+      dayNightSun.c_vecH[2];
+
+  cachedSunKeyUTC =
+      keyUTC;
+
+  cachedSunValid =
+      true;
+
+  if (!dayNightFirstLogDone) {
+    dayNightFirstLogDone = true;
+
+    double sunLat = 0.0;
+    double sunLon = 0.0;
+
+    dayNightSun.latlon(
+      sunLat,
+      sunLon
+    );
+
+    Serial.printf(
+      "[DAY/NIGHT] Sun lat=%.2f lon=%.2f UTC=%lld\n",
+      sunLat,
+      sunLon,
+      (long long)keyUTC
+    );
+  }
+
+  return true;
+}
+
+static bool getSunEarthQ14(
+  int16_t &sunXQ14,
+  int16_t &sunYQ14,
+  int16_t &sunZQ14
+) {
+  const time_t displayUTC =
+      replayActive ?
+      replayDisplayUTC :
+      time(nullptr);
+
+  if (
+    !updateDayNightSun(
+      displayUTC
+    )
+  ) {
+    return false;
+  }
+
+  sunXQ14 =
+      (int16_t)lround(
+        cachedSunEarthX *
+        NORMAL_ONE_Q14
+      );
+
+  sunYQ14 =
+      (int16_t)lround(
+        cachedSunEarthY *
+        NORMAL_ONE_Q14
+      );
+
+  sunZQ14 =
+      (int16_t)lround(
+        cachedSunEarthZ *
+        NORMAL_ONE_Q14
+      );
+
+  return true;
+}
+
+static uint8_t dayNightBrightness(
+  uint16_t row,
+  uint16_t col,
+  int16_t sunXQ14,
+  int16_t sunYQ14,
+  int16_t sunZQ14
+) {
+  const int16_t sinLat =
+      latitudeSinQ14[row];
+
+  const int16_t cosLat =
+      latitudeCosQ14[row];
+
+  const int16_t sinLon =
+      longitudeSinQ14[col];
+
+  const int16_t cosLon =
+      longitudeCosQ14[col];
+
+  const int16_t nx =
+      (int16_t)(
+        (
+          (int32_t)cosLat *
+          cosLon
+        ) >> 14
+      );
+
+  const int16_t ny =
+      (int16_t)(
+        (
+          (int32_t)cosLat *
+          sinLon
+        ) >> 14
+      );
+
+  const int16_t nz =
+      sinLat;
+
+  const int32_t dotQ28 =
+      (int32_t)nx *
+      (int32_t)sunXQ14 +
+      (int32_t)ny *
+      (int32_t)sunYQ14 +
+      (int32_t)nz *
+      (int32_t)sunZQ14;
+
+  const int16_t dotQ14 =
+      (int16_t)(
+        dotQ28 >> 14
+      );
+
+  if (dotQ14 >= TWILIGHT_DAY_Q14)
+    return 255;
+
+  if (dotQ14 <= TWILIGHT_NIGHT_Q14)
+    return NIGHT_MIN_BRIGHTNESS;
+
+  const int32_t numerator =
+      (
+        (int32_t)dotQ14 -
+        TWILIGHT_NIGHT_Q14
+      ) *
+      (
+        255 -
+        NIGHT_MIN_BRIGHTNESS
+      );
+
+  const int32_t denominator =
+      TWILIGHT_DAY_Q14 -
+      TWILIGHT_NIGHT_Q14;
+
+  return
+      (uint8_t)(
+        NIGHT_MIN_BRIGHTNESS +
+        numerator /
+        denominator
+      );
+}
 
 static inline uint16_t rgb565(
   uint8_t r,
@@ -3808,7 +9360,519 @@ static void fbCircle(
   }
 }
 
+
+static void fbLinePattern(
+  int16_t x0,
+  int16_t y0,
+  int16_t x1,
+  int16_t y1,
+  uint16_t colour,
+  bool dashed
+) {
+  int16_t dx =
+      abs(
+        x1 - x0
+      );
+
+  int16_t sx =
+      x0 < x1 ?
+      1 :
+      -1;
+
+  int16_t dy =
+      -abs(
+        y1 - y0
+      );
+
+  int16_t sy =
+      y0 < y1 ?
+      1 :
+      -1;
+
+  int16_t err =
+      dx + dy;
+
+  uint16_t step = 0;
+
+  while (true) {
+    // Dashed track uses a chunky 6-on / 3-off pattern so the visible
+    // segments remain easy to follow through bright cloud imagery.
+    const bool drawPixel =
+        !dashed ||
+        (
+          step %
+          9u
+        ) < 6u;
+
+    if (drawPixel) {
+      fbPixel(
+        x0,
+        y0,
+        colour
+      );
+    }
+
+    if (
+      x0 == x1 &&
+      y0 == y1
+    ) {
+      break;
+    }
+
+    const int16_t e2 =
+        2 * err;
+
+    if (e2 >= dy) {
+      err += dy;
+      x0 += sx;
+    }
+
+    if (e2 <= dx) {
+      err += dx;
+      y0 += sy;
+    }
+
+    ++step;
+  }
+}
+
+struct OrbitProjection {
+  float screenX;
+  float screenY;
+
+  // Camera-space distance toward the viewer, in Earth-radius units.
+  float cameraZ;
+
+  // Squared projected radius from globe centre, in Earth-radius units.
+  float projectedR2;
+
+  bool visible;
+};
+
+static OrbitProjection projectISSSpace(
+  const ISSSpacePoint &point,
+  float centreLonDeg
+) {
+  constexpr float VIEW_LAT_DEG =
+      10.0f;
+
+  const float centreLon =
+      radians(
+        centreLonDeg
+      );
+
+  const float sinCentre =
+      sinf(
+        centreLon
+      );
+
+  const float cosCentre =
+      cosf(
+        centreLon
+      );
+
+  // Rotate the Earth-fixed point so centreLonDeg is at the middle of the
+  // display.  This is the 3D equivalent of lon - centreLonDeg.
+  const float equatorialFront =
+      point.xER *
+      cosCentre +
+      point.yER *
+      sinCentre;
+
+  const float cameraX =
+      point.yER *
+      cosCentre -
+      point.xER *
+      sinCentre;
+
+  const float viewLat =
+      radians(
+        VIEW_LAT_DEG
+      );
+
+  const float sinView =
+      sinf(
+        viewLat
+      );
+
+  const float cosView =
+      cosf(
+        viewLat
+      );
+
+  const float cameraY =
+      cosView *
+      point.zER -
+      sinView *
+      equatorialFront;
+
+  const float cameraZ =
+      sinView *
+      point.zER +
+      cosView *
+      equatorialFront;
+
+  const float projectedR2 =
+      cameraX *
+      cameraX +
+      cameraY *
+      cameraY;
+
+  OrbitProjection p;
+
+  p.screenX =
+      (float)CX +
+      (float)RADIUS *
+      cameraX;
+
+  p.screenY =
+      (float)CY -
+      (float)RADIUS *
+      cameraY;
+
+  p.cameraZ =
+      cameraZ;
+
+  p.projectedR2 =
+      projectedR2;
+
+  // Orthographic occultation by the Earth:
+  //
+  //   front of Earth -> visible
+  //   behind Earth but projected outside the Earth disc -> visible
+  //   behind Earth and projected onto the Earth disc -> hidden
+  //
+  // This is what allows the real ISS orbit to remain visible just outside
+  // the limb even while the spacecraft is geometrically behind the globe.
+  p.visible =
+      cameraZ >= 0.0f ||
+      projectedR2 > 1.0f;
+
+  return p;
+}
+
+static ISSSpacePoint interpolateSpace(
+  const ISSSpacePoint &a,
+  const ISSSpacePoint &b,
+  float t
+) {
+  ISSSpacePoint out;
+
+  out.xER =
+      a.xER +
+      (
+        b.xER -
+        a.xER
+      ) *
+      t;
+
+  out.yER =
+      a.yER +
+      (
+        b.yER -
+        a.yER
+      ) *
+      t;
+
+  out.zER =
+      a.zER +
+      (
+        b.zER -
+        a.zER
+      ) *
+      t;
+
+  return out;
+}
+
+static ISSSpacePoint findOccultationBoundary(
+  const ISSSpacePoint &visiblePoint,
+  const ISSSpacePoint &hiddenPoint,
+  float centreLonDeg
+) {
+  ISSSpacePoint lo =
+      visiblePoint;
+
+  ISSSpacePoint hi =
+      hiddenPoint;
+
+  // Ten bisections locate the Earth-occultation boundary far more precisely
+  // than one display pixel at 240x240.
+  for (uint8_t i = 0; i < 10; ++i) {
+    const ISSSpacePoint mid =
+        interpolateSpace(
+          lo,
+          hi,
+          0.5f
+        );
+
+    const OrbitProjection p =
+        projectISSSpace(
+          mid,
+          centreLonDeg
+        );
+
+    if (p.visible)
+      lo = mid;
+    else
+      hi = mid;
+  }
+
+  return lo;
+}
+
+static void drawISSOrbit(
+  float centreLonDeg
+) {
+  if (
+    !appConfig.enableISS ||
+    replayActive ||
+    !issOrbitValid
+  ) {
+    return;
+  }
+
+  uint8_t activeBuffer;
+
+  portENTER_CRITICAL(
+    &issRenderMux
+  );
+
+  activeBuffer =
+      issOrbitActiveBuffer;
+
+  portEXIT_CRITICAL(
+    &issRenderMux
+  );
+
+  const ISSSpacePoint *points =
+      issOrbitBuffers[
+        activeBuffer
+      ];
+
+  // Past: warm amber/orange, solid.
+  // Using a different hue rather than merely a brightness change makes
+  // past/future immediately distinguishable even over cloud imagery.
+  const uint16_t pastColour =
+      rgb565(
+        255,
+        150,
+        35
+      );
+
+  // Future: bright cyan, dashed.
+  const uint16_t futureColour =
+      rgb565(
+        75,
+        235,
+        255
+      );
+
+  for (
+    uint16_t i = 1;
+    i < ISS_ORBIT_POINT_COUNT;
+    ++i
+  ) {
+    ISSSpacePoint a =
+        points[i - 1];
+
+    ISSSpacePoint b =
+        points[i];
+
+    OrbitProjection pa =
+        projectISSSpace(
+          a,
+          centreLonDeg
+        );
+
+    OrbitProjection pb =
+        projectISSSpace(
+          b,
+          centreLonDeg
+        );
+
+    if (
+      !pa.visible &&
+      !pb.visible
+    ) {
+      continue;
+    }
+
+    if (
+      pa.visible !=
+      pb.visible
+    ) {
+      if (pa.visible) {
+        b =
+            findOccultationBoundary(
+              a,
+              b,
+              centreLonDeg
+            );
+
+        pb =
+            projectISSSpace(
+              b,
+              centreLonDeg
+            );
+      }
+      else {
+        a =
+            findOccultationBoundary(
+              b,
+              a,
+              centreLonDeg
+            );
+
+        pa =
+            projectISSSpace(
+              a,
+              centreLonDeg
+            );
+      }
+    }
+
+    // Segment i joins points i-1 -> i.
+    // The central point is "now":
+    //
+    //   segments ending at/before NOW_INDEX = past, solid
+    //   segments after NOW_INDEX            = future, dashed
+    const bool past =
+        i <=
+        ISS_ORBIT_NOW_INDEX;
+
+    fbLinePattern(
+      (int16_t)lroundf(
+        pa.screenX
+      ),
+      (int16_t)lroundf(
+        pa.screenY
+      ),
+      (int16_t)lroundf(
+        pb.screenX
+      ),
+      (int16_t)lroundf(
+        pb.screenY
+      ),
+      past ?
+        pastColour :
+        futureColour,
+      !past
+    );
+  }
+}
+
+static void drawISSMarker(
+  float centreLonDeg
+) {
+  if (
+    !appConfig.enableISS ||
+    replayActive
+  ) {
+    return;
+  }
+
+  bool valid;
+  ISSSpacePoint current;
+
+  portENTER_CRITICAL(
+    &issRenderMux
+  );
+
+  valid =
+      issPositionValid;
+
+  current.xER =
+      issCurrentXER;
+
+  current.yER =
+      issCurrentYER;
+
+  current.zER =
+      issCurrentZER;
+
+  portEXIT_CRITICAL(
+    &issRenderMux
+  );
+
+  if (!valid)
+    return;
+
+  const OrbitProjection p =
+      projectISSSpace(
+        current,
+        centreLonDeg
+      );
+
+  if (!p.visible)
+    return;
+
+  const int16_t x =
+      (int16_t)lroundf(
+        p.screenX
+      );
+
+  const int16_t y =
+      (int16_t)lroundf(
+        p.screenY
+      );
+
+  const uint16_t outer =
+      rgb565(
+        255,
+        190,
+        32
+      );
+
+  const uint16_t centre =
+      rgb565(
+        255,
+        255,
+        255
+      );
+
+  // Current ISS marker is drawn at its true scaled orbital altitude.
+  // One step larger than the previous version, but still compact relative
+  // to the 240x240 globe.
+  for (int8_t d = -5; d <= 5; ++d) {
+    fbPixel(x + d, y,     outer);
+    fbPixel(x,     y + d, outer);
+  }
+
+  // Diagonal shoulders make it read as a compact spacecraft-like glyph.
+  fbPixel(x - 3, y - 3, outer);
+  fbPixel(x + 3, y - 3, outer);
+  fbPixel(x - 3, y + 3, outer);
+  fbPixel(x + 3, y + 3, outer);
+
+  // Bright 3x3 centre.
+  for (int8_t yy = -1; yy <= 1; ++yy) {
+    for (int8_t xx = -1; xx <= 1; ++xx) {
+      fbPixel(
+        x + xx,
+        y + yy,
+        centre
+      );
+    }
+  }
+}
+
 static void buildShadeLUT() {
+  if (!shadeLUT) {
+    shadeLUT =
+        (uint8_t *)allocPSRAMPreferred(
+          256
+        );
+
+    if (!shadeLUT) {
+      Serial.println(
+        "[MEM] shade LUT allocation failed"
+      );
+      return;
+    }
+  }
+
+  // Existing globe limb shading.
   for (uint16_t i = 0; i < 256; ++i) {
     const float r2 =
         (float)i /
@@ -3830,6 +9894,75 @@ static void buildShadeLUT() {
         (uint8_t)lroundf(
           brightness *
           255.0f
+        );
+  }
+
+  // Geographic latitude row lookup.
+  // Row 0 is near +90 deg; row 128 is near the equator.
+  for (
+    uint16_t row = 0;
+    row < EARTH_H;
+    ++row
+  ) {
+    const float latDeg =
+        90.0f -
+        (
+          (
+            (float)row +
+            0.5f
+          ) *
+          180.0f /
+          (float)EARTH_H
+        );
+
+    const float latRad =
+        radians(latDeg);
+
+    latitudeSinQ14[row] =
+        (int16_t)lroundf(
+          sinf(latRad) *
+          NORMAL_ONE_Q14
+        );
+
+    latitudeCosQ14[row] =
+        (int16_t)lroundf(
+          cosf(latRad) *
+          NORMAL_ONE_Q14
+        );
+  }
+
+  // Geographic longitude column lookup.
+  // The reverse map puts 0 deg longitude at column 256.
+  for (
+    uint16_t col = 0;
+    col < EARTH_W;
+    ++col
+  ) {
+    const float lonDeg =
+        (
+          (
+            (float)col +
+            0.5f
+          ) -
+          (float)EARTH_W /
+          2.0f
+        ) *
+        360.0f /
+        (float)EARTH_W;
+
+    const float lonRad =
+        radians(lonDeg);
+
+    longitudeSinQ14[col] =
+        (int16_t)lroundf(
+          sinf(lonRad) *
+          NORMAL_ONE_Q14
+        );
+
+    longitudeCosQ14[col] =
+        (int16_t)lroundf(
+          cosf(lonRad) *
+          NORMAL_ONE_Q14
         );
   }
 }
@@ -4026,11 +10159,28 @@ static uint8_t sampleIRAlpha(
 static void drawEarthAndClouds(
   float centreLonDeg
 ) {
-  if (cloudMutex)
+  if (
+    appConfig.enableClouds &&
+    cloudMutex
+  ) {
     xSemaphoreTake(
       cloudMutex,
       portMAX_DELAY
     );
+  }
+
+  int16_t sunXQ14 = 0;
+  int16_t sunYQ14 = 0;
+  int16_t sunZQ14 = 0;
+
+  const bool haveDayNight =
+      appConfig.enableDayNight &&
+      getSunEarthQ14(
+        sunXQ14,
+        sunYQ14,
+        sunZQ14
+      );
+
   int32_t lonShift =
       (int32_t)lroundf(
         centreLonDeg *
@@ -4149,31 +10299,31 @@ static void drawEarthAndClouds(
           g = shade8(g, brightness);
           b = shade8(b, brightness);
 
-          const uint8_t ir =
-              sampleIRLuma(
-                row,
-                col
-              );
+          if (appConfig.enableClouds) {
+            const uint8_t ir =
+                sampleIRLuma(
+                  row,
+                  col
+                );
 
-          const uint8_t cloudA =
-              sampleIRAlpha(
-                row,
-                col
-              );
+            const uint8_t cloudA =
+                sampleIRAlpha(
+                  row,
+                  col
+                );
 
-          uint8_t alpha = 0;
+            uint8_t alpha = 0;
 
-          if (cloudA != 0) {
-            const uint16_t alphaBase =
-                (uint16_t)cloudA *
-                (uint16_t)globalCloudAlphaScale;
+            if (cloudA != 0) {
+              const uint16_t alphaBase =
+                  (uint16_t)cloudA *
+                  (uint16_t)globalCloudAlphaScale;
 
-            const uint8_t lumaAlpha =
-                cloudOpacityLUT[
-                  ir
-                ];
+              const uint8_t lumaAlpha =
+                  cloudOpacityLUT[
+                    ir
+                  ];
 
-            if (useAlphaPrimaryOpacity) {
               alpha =
                   (uint8_t)(
                     (
@@ -4182,41 +10332,60 @@ static void drawEarthAndClouds(
                     ) >> 16
                   );
             }
-            else {
+
+            if (alpha != 0) {
+              const uint16_t boosted =
+                  (
+                    (uint16_t)alpha *
+                    CLOUD_OPACITY_GAIN_PERCENT
+                  ) / 100u;
+
               alpha =
                   (uint8_t)(
-                    (
-                      alphaBase *
-                      (uint16_t)lumaAlpha
-                    ) >> 16
+                    boosted > 255u ?
+                    255u :
+                    boosted
                   );
+
+              uint8_t cr, cg, cb;
+
+              makeCloudTintFromBase(
+                r, g, b,
+                cr, cg, cb
+              );
+
+              r = blend8(r, cr, alpha);
+              g = blend8(g, cg, alpha);
+              b = blend8(b, cb, alpha);
             }
           }
 
-          if (alpha != 0) {
-            const uint16_t boosted =
-                (
-                  (uint16_t)alpha *
-                  CLOUD_OPACITY_GAIN_PERCENT
-                ) / 100u;
-
-            alpha =
-                (uint8_t)(
-                  boosted > 255u ?
-                  255u :
-                  boosted
+          // Apply solar illumination AFTER clouds so the entire visible
+          // atmosphere/terrain darkens together on the night hemisphere.
+          if (haveDayNight) {
+            const uint8_t solarBrightness =
+                dayNightBrightness(
+                  row,
+                  col,
+                  sunXQ14,
+                  sunYQ14,
+                  sunZQ14
                 );
 
-            uint8_t cr, cg, cb;
-
-            makeCloudTintFromBase(
-              r, g, b,
-              cr, cg, cb
+            r = shade8(
+              r,
+              solarBrightness
             );
 
-            r = blend8(r, cr, alpha);
-            g = blend8(g, cg, alpha);
-            b = blend8(b, cb, alpha);
+            g = shade8(
+              g,
+              solarBrightness
+            );
+
+            b = shade8(
+              b,
+              solarBrightness
+            );
           }
 
           pixel =
@@ -4294,7 +10463,15 @@ static void draw(
     centreLonDeg
   );
 
+  drawISSOrbit(
+    centreLonDeg
+  );
+
   drawLimb();
+
+  drawISSMarker(
+    centreLonDeg
+  );
 
   // Clock/date/download state is now part of the completed framebuffer.
   composeCornerOverlay(
@@ -4374,10 +10551,11 @@ static float updateLiveLongitude() {
 
 
 // -----------------------------------------------------------------------------
-// Corner time/date — live JST, replay uses archived weather-frame JST
+// Corner time/date — runtime-configured local zone.
+// Replay uses the archived weather-frame UTC converted by the same offset.
 // -----------------------------------------------------------------------------
 
-static void formatJSTCorner(
+static void formatLocalCorner(
   time_t utc,
   char timeText[6],
   char dateText[7]
@@ -4388,12 +10566,17 @@ static void formatJSTCorner(
     "SEP", "OCT", "NOV", "DEC"
   };
 
-  const time_t jst =
+  const time_t localTime =
       utc +
-      9 * 60 * 60;
+      (time_t)
+      appConfig.utcOffsetMinutes *
+      60;
 
   struct tm t = {};
-  gmtime_r(&jst, &t);
+  gmtime_r(
+    &localTime,
+    &t
+  );
 
   snprintf(
     timeText,
@@ -4435,136 +10618,197 @@ static void composeCornerOverlay(
   char timeText[6];
   char dateText[7];
 
-  formatJSTCorner(
+  formatLocalCorner(
     displayUTC,
     timeText,
     dateText
   );
 
-  constexpr int16_t OVERLAY_X = 3;
-  constexpr int16_t OVERLAY_Y = 3;
-  constexpr int16_t OVERLAY_W = 91;
-  constexpr int16_t OVERLAY_H = 20;
+  // The globe is centred at (120,120), radius 112.  Two 16-pixel-high text
+  // blocks fit in the extreme top corners without covering the Earth.
+  constexpr int16_t BLOCK_W = 74;
+  constexpr int16_t BLOCK_H = 18;
+  constexpr int16_t TOP_Y = 1;
+  constexpr int16_t DATE_X = 2;
+  constexpr int16_t TIME_X =
+      Globe::SCREEN_W -
+      BLOCK_W -
+      2;
+  constexpr int16_t STATUS_X =
+      (
+        Globe::SCREEN_W -
+        BLOCK_W
+      ) /
+      2;
 
-  // Small off-screen Adafruit_GFX canvas. Start by copying the already
-  // rendered Earth/cloud pixels beneath this area into the canvas. Text is
-  // then drawn transparently on top and the result is copied back into the
-  // main framebuffer. No solid rectangle obscures the globe.
-  static GFXcanvas16 cornerCanvas(
-    OVERLAY_W,
-    OVERLAY_H
+  // Reuse one transparent off-screen canvas for all three top regions.  At
+  // 74x18 this is smaller than the previous 91x20 corner canvas.
+  static GFXcanvas16 topCanvas(
+    BLOCK_W,
+    BLOCK_H
   );
 
   uint16_t *canvasPixels =
-      cornerCanvas.getBuffer();
+      topCanvas.getBuffer();
 
   if (!canvasPixels)
     return;
 
-  for (
-    int16_t y = 0;
-    y < OVERLAY_H;
-    ++y
-  ) {
-    memcpy(
-      canvasPixels +
-      y * OVERLAY_W,
-      frameBuffer +
-      (
-        OVERLAY_Y + y
-      ) *
-      Globe::SCREEN_W +
-      OVERLAY_X,
-      OVERLAY_W *
-      sizeof(uint16_t)
-    );
-  }
+  auto copyFrameToCanvas =
+      [&](int16_t screenX, int16_t screenY) {
+        for (
+          int16_t y = 0;
+          y < BLOCK_H;
+          ++y
+        ) {
+          memcpy(
+            canvasPixels +
+              y * BLOCK_W,
+            frameBuffer +
+              (
+                screenY + y
+              ) *
+              Globe::SCREEN_W +
+              screenX,
+            BLOCK_W *
+              sizeof(uint16_t)
+          );
+        }
+      };
 
-  cornerCanvas.setTextWrap(false);
-  cornerCanvas.setTextSize(1);
+  auto copyCanvasToFrame =
+      [&](int16_t screenX, int16_t screenY) {
+        for (
+          int16_t y = 0;
+          y < BLOCK_H;
+          ++y
+        ) {
+          memcpy(
+            frameBuffer +
+              (
+                screenY + y
+              ) *
+              Globe::SCREEN_W +
+              screenX,
+            canvasPixels +
+              y * BLOCK_W,
+            BLOCK_W *
+              sizeof(uint16_t)
+          );
+        }
+      };
 
-  cornerCanvas.setTextColor(
+  topCanvas.setTextWrap(false);
+
+  // Large date at top left.
+  copyFrameToCanvas(
+    DATE_X,
+    TOP_Y
+  );
+
+  topCanvas.setTextSize(2);
+  topCanvas.setTextColor(
     tft.color565(
-      235, 240, 242
+      190, 202, 208
+    )
+  );
+  topCanvas.setCursor(0, 0);
+  topCanvas.print(dateText);
+
+  copyCanvasToFrame(
+    DATE_X,
+    TOP_Y
+  );
+
+  // Large time at top right.
+  copyFrameToCanvas(
+    TIME_X,
+    TOP_Y
+  );
+
+  topCanvas.setTextSize(2);
+  topCanvas.setTextColor(
+    tft.color565(
+      240, 245, 247
     )
   );
 
-  cornerCanvas.setCursor(4, 2);
-  cornerCanvas.print(timeText);
+  int16_t boundsX = 0;
+  int16_t boundsY = 0;
+  uint16_t timeWidth = 0;
+  uint16_t timeHeight = 0;
 
-  cornerCanvas.setTextColor(
-    tft.color565(
-      180, 192, 198
-    )
+  topCanvas.getTextBounds(
+    timeText,
+    0,
+    0,
+    &boundsX,
+    &boundsY,
+    &timeWidth,
+    &timeHeight
   );
 
-  cornerCanvas.setCursor(4, 10);
-  cornerCanvas.print(dateText);
+  topCanvas.setCursor(
+    max(
+      0,
+      BLOCK_W -
+      (int16_t)timeWidth
+    ),
+    0
+  );
+  topCanvas.print(timeText);
 
-  if (replayActive) {
-    cornerCanvas.setTextColor(
+  copyCanvasToFrame(
+    TIME_X,
+    TOP_Y
+  );
+
+  // Preserve replay/download/button feedback in the centre strip.  The 1x
+  // font occupies rows 0-7, immediately above the circular globe.
+  char statusText[16] = "";
+  uint16_t statusColor =
       tft.color565(
         205, 215, 220
-      )
-    );
+      );
 
-    cornerCanvas.setCursor(47, 6);
-    cornerCanvas.print(
+  if (replayActive) {
+    strlcpy(
+      statusText,
       replayModeName(
         replayMode
-      )
+      ),
+      sizeof(statusText)
     );
   }
   else if (replayStartPending) {
-    cornerCanvas.setTextColor(
-      tft.color565(
-        205, 215, 220
-      )
+    strlcpy(
+      statusText,
+      "WAIT",
+      sizeof(statusText)
     );
-
-    cornerCanvas.setCursor(46, 6);
-    cornerCanvas.print("WAIT");
   }
   else if (
     buttonPreviewClicks > 0
   ) {
-    char clickPreview[5];
-
     snprintf(
-      clickPreview,
-      sizeof(clickPreview),
+      statusText,
+      sizeof(statusText),
       "%ux",
       (unsigned)buttonPreviewClicks
     );
 
-    cornerCanvas.setTextColor(
-      tft.color565(
-        240, 245, 245
-      )
-    );
-
-    cornerCanvas.setCursor(50, 6);
-    cornerCanvas.print(
-      clickPreview
-    );
+    statusColor =
+        tft.color565(
+          240, 245, 245
+        );
   }
   else if (liveFetchBusy) {
-    cornerCanvas.setTextColor(
-      tft.color565(
-        205, 215, 220
-      )
-    );
-
-    cornerCanvas.setCursor(43, 6);
-
     if (
       httpBodyExpected > 0
     ) {
-      char netProgress[12];
-
       snprintf(
-        netProgress,
-        sizeof(netProgress),
+        statusText,
+        sizeof(statusText),
         "%lu/%ldK",
         (unsigned long)(
           httpBodyBytes /
@@ -4575,14 +10819,12 @@ static void composeCornerOverlay(
           1024L
         )
       );
-
-      cornerCanvas.print(
-        netProgress
-      );
     }
     else {
-      cornerCanvas.print(
-        "NET"
+      strlcpy(
+        statusText,
+        "NET",
+        sizeof(statusText)
       );
     }
   }
@@ -4590,48 +10832,64 @@ static void composeCornerOverlay(
     backfillActive &&
     backfillTotal > 0
   ) {
-    char progress[12];
-
     snprintf(
-      progress,
-      sizeof(progress),
+      statusText,
+      sizeof(statusText),
       "%u/%u",
       (unsigned)backfillDone,
       (unsigned)backfillTotal
     );
 
-    cornerCanvas.setTextColor(
-      tft.color565(
-        165, 180, 188
-      )
-    );
-
-    cornerCanvas.setCursor(45, 6);
-    cornerCanvas.print(
-      progress
-    );
+    statusColor =
+        tft.color565(
+          165, 180, 188
+        );
   }
 
-  const uint16_t *src =
-      canvasPixels;
+  if (statusText[0] != '\0') {
+    copyFrameToCanvas(
+      STATUS_X,
+      0
+    );
 
-  for (
-    int16_t y = 0;
-    y < OVERLAY_H;
-    ++y
-  ) {
-    memcpy(
-      frameBuffer +
-      (
-        OVERLAY_Y + y
-      ) *
-      Globe::SCREEN_W +
-      OVERLAY_X,
-      src +
-      y *
-      OVERLAY_W,
-      OVERLAY_W *
-      sizeof(uint16_t)
+    topCanvas.setTextSize(1);
+    topCanvas.setTextColor(
+      statusColor
+    );
+
+    int16_t statusBoundsX = 0;
+    int16_t statusBoundsY = 0;
+    uint16_t statusWidth = 0;
+    uint16_t statusHeight = 0;
+
+    topCanvas.getTextBounds(
+      statusText,
+      0,
+      0,
+      &statusBoundsX,
+      &statusBoundsY,
+      &statusWidth,
+      &statusHeight
+    );
+
+    topCanvas.setCursor(
+      max(
+        0,
+        (
+          BLOCK_W -
+          (int16_t)statusWidth
+        ) /
+        2
+      ),
+      0
+    );
+    topCanvas.print(
+      statusText
+    );
+
+    copyCanvasToFrame(
+      STATUS_X,
+      0
     );
   }
 }
@@ -4669,6 +10927,17 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  // Arduino-ESP32's mbedTLS allocator uses internal DRAM by default.  Preserve
+  // that scarce pool by making ordinary sketch malloc/new prefer PSRAM.  Calls
+  // that explicitly require internal/DMA memory are unaffected.
+  if (psramFound()) {
+    heap_caps_malloc_extmem_enable(0);
+
+    Serial.printf(
+      "[MEM] PSRAM policy enabled: ordinary malloc prefers external RAM\n"
+    );
+  }
+
   tft.init(
     240,
     240,
@@ -4676,12 +10945,11 @@ void setup() {
   );
 
   tft.setRotation(2);
+  tft.fillScreen(ST77XX_BLACK);
 
-  bootLog.begin(
-    "GLOBAL WEATHER GLOBE"
-  );
+  beginBootLog();
 
-  bootLog.println(
+  bootPrintln(
     "[MEM] Allocating PSRAM..."
   );
 
@@ -4689,7 +10957,7 @@ void setup() {
     !allocateRuntimeMemory() ||
     !Globe::begin()
   ) {
-    bootLog.println(
+    bootPrintln(
       "[FAIL] Memory"
     );
 
@@ -4697,7 +10965,7 @@ void setup() {
       delay(1000);
   }
 
-  bootLog.println(
+  bootPrintln(
     "[MEM] OK"
   );
 
@@ -4711,7 +10979,7 @@ void setup() {
     !cloudMutex ||
     !workMutex
   ) {
-    bootLog.println(
+    bootPrintln(
       "[FAIL] Mutex"
     );
 
@@ -4731,13 +10999,13 @@ void setup() {
     xTaskCreate(
       buttonTask,
       "button",
-      3072,
+      2048,
       nullptr,
       2,
       &buttonTaskHandle
     ) != pdPASS
   ) {
-    bootLog.println(
+    bootPrintln(
       "[FAIL] Button task"
     );
 
@@ -4745,73 +11013,157 @@ void setup() {
       delay(1000);
   }
 
-  bootLog.println(
+  bootPrintln(
     "[BUTTON] Ready"
   );
 
-  bootLog.println(
+  beginISSNeoPixel();
+
+  bootPrintln(
+    "[NEO] ISS status ready"
+  );
+
+  bootPrintln(
     "[SD] Mounting..."
   );
 
   if (initSDCard()) {
-    bootLog.printf(
+    bootPrintf(
       "[SD] %llu MB ready",
       SD.cardSize() /
       (1024ULL * 1024ULL)
     );
+
+    loadRuntimeConfig();
+
+    bootPrintf(
+      "[CFG] ISS%d CLD%d DN%d",
+      appConfig.enableISS ? 1 : 0,
+      appConfig.enableClouds ? 1 : 0,
+      appConfig.enableDayNight ? 1 : 0
+    );
+
+    if (appConfig.enableISS) {
+      ensureISSDir();
+      loadISSFetchState();
+      loadISSTLECache();
+
+      bootPrintln(
+        appConfig.observerConfigured ?
+          "[OBS] Coordinates OK" :
+          "[OBS] Add LAT/LON/ALT"
+      );
+    }
+    else {
+      bootPrintln(
+        "[ISS] Disabled"
+      );
+    }
   }
   else {
-    bootLog.println(
-      "[SD] FAILED - live only"
+    resetRuntimeConfigDefaults();
+
+    bootPrintln(
+      "[SD] FAILED - no config"
     );
   }
 
-  bootLog.println(
+  bootPrintln(
     "[WIFI] Connecting..."
   );
 
   if (!wifiConnect()) {
-    bootLog.println(
+    bootPrintln(
       "[WIFI] FAILED"
     );
   }
   else {
-    bootLog.printf(
+    bootPrintf(
       "[WIFI] RSSI %d dBm",
       WiFi.RSSI()
     );
   }
 
-  bootLog.println(
+  bootPrintln(
     "[TIME] Sync UTC..."
   );
 
   if (syncUTC()) {
-    bootLog.println(
-      "[TIME] OK / JST +9"
+    char tzStatus[32];
+
+    const int offset =
+        appConfig.utcOffsetMinutes;
+
+    const char sign =
+        offset < 0 ?
+        '-' :
+        '+';
+
+    const int absMinutes =
+        abs(offset);
+
+    snprintf(
+      tzStatus,
+      sizeof(tzStatus),
+      "[TIME] OK %s %c%02d:%02d",
+      appConfig.timezoneLabel,
+      sign,
+      absMinutes / 60,
+      absMinutes % 60
     );
+
+    bootPrintln(
+      tzStatus
+    );
+
+    if (appConfig.enableISS) {
+      serviceISSTLE(true);
+    }
   }
   else {
-    bootLog.println(
+    bootPrintln(
       "[TIME] FAILED"
     );
+
+    if (appConfig.enableISS) {
+      bootPrintln(
+        "[ISS] No UTC - cache only"
+      );
+    }
   }
 
-  bootLog.println(
-    "[NSMC] Availability in BG"
-  );
+  if (appConfig.enableClouds) {
+    bootPrintln(
+      "[NSMC] Availability in BG"
+    );
 
-  if (sdReady) {
-    bootLog.println(
-      "[ARCHIVE] 7d gap repair"
+    if (sdReady) {
+      bootPrintln(
+        "[ARCHIVE] 7d gap repair"
+      );
+    }
+  }
+  else {
+    bootPrintln(
+      "[CLOUDS] Disabled"
     );
   }
 
-  bootLog.println(
+  bootPrintln(
+    appConfig.enableDayNight ?
+      "[DAY/NIGHT] Enabled" :
+      "[DAY/NIGHT] Disabled"
+  );
+
+  bootPrintln(
     "[READY] Starting globe"
   );
 
   delay(350);
+
+  // Startup status is complete. The SSD1306 now sleeps between passes
+  // and is woken automatically by serviceISSOLED() at the geometric horizon.
+  finishBootLog();
 
   // Priority 0 is intentional on the single-core ESP32-S2.
   // The renderer/Arduino loop stays responsive; network/archive work runs
@@ -4819,7 +11171,7 @@ void setup() {
   xTaskCreate(
     weatherTask,
     "weather",
-    12288,
+    8192,
     nullptr,
     0,
     &weatherTaskHandle
@@ -4827,6 +11179,11 @@ void setup() {
 }
 
 void loop() {
+  serviceLateNTPSyncLog();
+
+  // Cloud-playback gesture events arrive here.  The SSD1306 forecast request
+  // is intentionally handled separately and begins on the physical press,
+  // before this gesture has necessarily been finalised.
   const ButtonEvent event =
       takeButtonEvent();
 
@@ -4850,7 +11207,10 @@ void loop() {
   ) {
     finishReplay();
   }
-  else if (sdReady) {
+  else if (
+    sdReady &&
+    appConfig.enableClouds
+  ) {
     if (
       event ==
       ButtonEvent::Single
@@ -4878,6 +11238,13 @@ void loop() {
   }
 
   serviceReplay();
+
+  // Smooth NeoPixel animation is intentionally independent of the 7-second
+  // ISS propagation cadence.
+  serviceISSNeoPixel();
+
+  // OHI-style pass telemetry wakes only while the ISS is above the horizon.
+  serviceISSOLED();
 
   const float displayLongitudeDeg =
       replayActive ?
