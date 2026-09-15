@@ -1,0 +1,58 @@
+# ESP32-S2 Live Cloud Globe runtime configuration
+# Copy this file to the ROOT of the microSD card and rename it:
+#
+#   /config.ini
+#
+# Lines beginning with # or ; are comments.
+# Boolean values accept: 1/0, true/false, yes/no, on/off.
+
+# -------------------------------------------------------------------
+# Wi-Fi
+# -------------------------------------------------------------------
+WIFI_SSID=YOUR_WIFI_NAME
+WIFI_PASSWORD=YOUR_WIFI_PASSWORD
+
+# -------------------------------------------------------------------
+# Local display time
+# -------------------------------------------------------------------
+# Offset from UTC in MINUTES.
+# Examples:
+#   Japan                  540
+#   UTC                      0
+#   India                  330
+#   US Eastern standard   -300
+#
+# This is intentionally a fixed offset rather than an automatic DST rule.
+UTC_OFFSET_MINUTES=540
+TIMEZONE_LABEL=JST
+
+# -------------------------------------------------------------------
+# Observer location
+# -------------------------------------------------------------------
+# Required for ISS azimuth/elevation and optical visibility.
+#
+# Latitude:  north positive, south negative
+# Longitude: east positive, west negative
+# Altitude:  metres above sea level
+#
+# Uncomment and replace these example values with YOUR fixed installation coordinates.
+# If any of the three keys is omitted or invalid, observer calculations are
+# disabled rather than silently assuming 0,0.
+# OBSERVER_LAT=35.000000
+# OBSERVER_LON=135.000000
+# OBSERVER_ALT_M=0.0
+
+# Geometric horizon is 0 degrees. Raise this if trees, terrain or buildings
+# block your local horizon.
+VISIBLE_MIN_ELEVATION_DEG=0.0
+
+# Observer Sun must be below this elevation before "VISIBLE=1".
+# -6 degrees = civil twilight and is a useful conservative default.
+VISIBLE_SUN_MAX_ELEVATION_DEG=-6.0
+
+# -------------------------------------------------------------------
+# Feature toggles
+# -------------------------------------------------------------------
+ISS=1
+CLOUDS=1
+DAY_NIGHT=1
