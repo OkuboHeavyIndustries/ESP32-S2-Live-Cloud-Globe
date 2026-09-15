@@ -1,662 +1,126 @@
-/*Buy me a coffee!
+# Cloud Globe V2
 
-Bitcoin: 19H3zFF4W3zUZ3jAdjmiDNNLs8Ja46M6AD
+A standalone 240 × 240 true-colour Earth display based on an **Adafruit QtPy ESP32-S2**. It renders NASA Blue Marble surface imagery, current CMA/NSMC global IR cloud observations, a real day/night terminator, and a locally propagated ISS orbit. A 128 × 64 OLED provides startup status and ISS pass/visibility information, while a microSD card stores configuration, TLE state and a replayable weather archive.
 
-ETH: 0xD656DB37b61ac30Fa1e16a3162719FE417b231C8
-
-*/
-
-
-# ESP32-S2 Live Cloud Globe
-
-A standalone **240×240 spinning Earth display with live global cloud imagery**, built around an **Adafruit QtPy ESP32-S2** and a **1.3-inch ST7789 IPS display**.
-
-The globe uses a NASA Blue Marble Earth texture and overlays current global infrared cloud imagery from the **China Meteorological Administration / National Satellite Meteorological Center (NSMC)**.
-
-Cloud images are archived automatically to a microSD card, allowing historical weather playback from a single pushbutton.
-
----
-
-## Features
-
-- Smooth 240×240 rotating Earth
-- NASA Blue Marble true-colour surface texture
-- Global cloud imagery from NSMC `GEOS_IRX`
-- Live cloud image updated automatically
-- Transparent clock/date overlay in JST
-- Automatic microSD archive
-- Official NSMC availability API used instead of guessing timestamps
-- Automatic repair of missing archive frames
-- Seven-day archive backfill window
-- Historical weather playback:
-  - single click → last 24 hours
-  - double click → last 7 days
-  - triple click → last 30 days
-  - long press → return to live
-- Replay timestamp shows the actual archived weather time
-- Globe rotation pauses during replay and resumes from the same longitude afterward
-- Cooperative HTTPS download handling to keep the single-core ESP32-S2 responsive
-- Separate SPI buses for display and SD card
-
----
+This folder is intentionally the **clean release source**: historical TLS/backend probes, PNG-corruption forensics, heap diagnostics and other investigation-only code have been removed. Operational error logging remains.
 
 ## Hardware
 
-### Main controller
+- Adafruit QtPy ESP32-S2
+- ZJY-IPS130-V2.0 / ST7789 240 × 240 SPI TFT
+- SSD1306 128 × 64 I²C OLED at `0x3C`
+- microSD breakout
+- momentary pushbutton (Cherry MX used in the finished unit)
 
-- **Adafruit QtPy ESP32-S2**
-- PSRAM-capable version strongly recommended
+### Wiring
 
-The project uses PSRAM for the full-frame display buffer, downloaded PNG data and decoded cloud buffers.
+| Module | Signal | QtPy ESP32-S2 |
+|---|---|---|
+| ST7789 | SCK / CLK | SCK |
+| ST7789 | MOSI / SDA | MO |
+| ST7789 | RST / RES | A0 |
+| ST7789 | DC | A1 |
+| ST7789 | VCC | 3V |
+| ST7789 | BLK | 3V |
+| SSD1306 | SDA | SDA |
+| SSD1306 | SCL | SCL |
+| SSD1306 | VCC | 5V |
+| microSD | SCK | A2 |
+| microSD | MOSI | A3 |
+| microSD | MISO | RX |
+| microSD | CS | TX |
+| Button | switch input | MI / MISO pad |
+| Button | other contact | GND |
 
-### Display
+The ST7789 used here has **no CS pin**, so the SD card deliberately uses a separate SPI bus.
 
-- **ZJY-IPS130-V2.0**
-- ST7789 controller
-- 240×240 pixels
-- SPI
-- 1.3-inch IPS
+## Required Arduino libraries
 
-### Storage
+- Adafruit GFX Library
+- Adafruit ST7735 and ST7789 Library
+- Adafruit NeoPixel
+- U8g2
+- PNGdec
+- AioP13
 
-- microSD card reader
-- Tested successfully with a ~64 GB SDXC card
+The ESP32 Arduino core supplies WiFi, HTTPClient, WiFiClientSecure, SD, SPI and Wire.
 
-### Input
+## Important: `build_opt.h`
 
-- one momentary pushbutton
+Keep `build_opt.h` in the same sketch folder when compiling.
 
----
+PNGdec 1.1.6's default buffered-pixel allocation is slightly too small for two aligned 320-pixel RGBA scanlines. That can overwrite its adjacent input buffer and corrupt the lower portion of some NSMC images. This release uses:
 
-## Display wiring
+```text
+-DPNG_MAX_BUFFERED_PIXELS=2624
+```
 
-The ST7789 is connected to the normal QtPy SPI pins.
+as a sketch-wide compiler option so **both** the sketch and `PNGdec.cpp` see the same `PNG` class layout. Do not copy only the `.ino` into a different folder without also copying `build_opt.h`.
 
-| Display | QtPy ESP32-S2 |
-|---|---|
-| GND | GND |
-| VCC | 3V |
-| SCL / CLK | SCK |
-| SDA / MOSI | MO |
-| RES | A0 |
-| DC | A1 |
-| BLK | 3V |
+## SD card configuration
 
-The display used for this project has **no CS line**.
+Copy `config.ini.example` to the root of the SD card as:
 
-Known-good display initialization:
+```text
+/config.ini
+```
+
+Then set your Wi-Fi credentials, UTC offset/timezone label and observer location.
+
+The observer coordinates are used for ISS azimuth/elevation, pass prediction and optical-visibility calculations. `VISIBLE_MIN_ELEVATION_DEG` can be raised if terrain or buildings block the local horizon. `VISIBLE_SUN_MAX_ELEVATION_DEG=-6` corresponds to civil twilight.
+
+## Controls
+
+- **1 click:** replay previous 24 hours
+- **2 clicks:** replay previous 7 days
+- **3 clicks:** replay previous 30 days
+- **long press:** stop replay and return to live mode
+- **any physical press:** immediately wakes the OLED forecast page while the multi-click gesture is still being resolved
+
+The live globe rotation pauses during replay and resumes from the same longitude afterward. Replay time/date and the day/night terminator use the archived frame timestamp rather than current time.
+
+## Weather data
+
+Clouds come from the China Meteorological Administration / National Satellite Meteorological Center global GEO IR product, WMS layer `GEOS_IRX`.
+
+The official NSMC availability API is treated as the source of truth. The firmware polls it every 15 minutes, displays the newest listed frame, archives successful frames to microSD and incrementally repairs gaps from the preceding seven days without monopolising the background worker.
+
+The original PNG is decoded directly. There is no synthetic weather fallback.
+
+## ISS tracking
+
+The firmware fetches only **ISS (ZARYA), NORAD 25544** from CelesTrak, caches the TLE on SD and propagates it locally with AioP13. Successful TLE refreshes are limited to once per 24 hours; failed stale-TLE retries are limited to once per two hours and the timestamps persist across reboots.
+
+The globe shows a ±60 minute 3D orbit track and the current ISS position. The OLED shows live observer geometry during a pass and forecast information when requested.
+
+To experiment with another ordinary TLE satellite, change the `CATNR` in `ISS_TLE_URL` and delete `/iss/iss.tle` plus `/iss/fetch_state.txt` from the SD card before first boot so the old ISS cache cannot be reused.
+
+## Wi-Fi behaviour
+
+The release firmware is geographically neutral: it does **not** hard-code a Wi-Fi regulatory country. It disables modem sleep during network activity and requests the 19.5 dBm Arduino-ESP32 transmit-power setting. Automatic driver reconnect is disabled; network operations retry explicitly through `wifiConnect()` instead. This avoids rapid reconnect loops on a marginal RF link.
+
+If an installation needs an explicit regulatory domain, add the appropriate ESP-IDF country setting for that location. For example, a Japan installation can use:
 
 ```cpp
-tft.init(240, 240, SPI_MODE3);
-tft.setRotation(2);
+#include <esp_wifi.h>
+
+// Optional installation-specific setting — use the correct code for your country.
+esp_wifi_set_country_code("JP", false);
 ```
 
----
+Place the call after `WiFi.mode(WIFI_STA)` and before `WiFi.begin(...)`. Do not copy `"JP"` blindly for installations in other countries.
 
-## SD card wiring
+## Main source files
 
-The SD card uses a **separate SPI bus** because the ST7789 has no chip-select line and is therefore permanently selected.
+- `ESP32_S2_Live_Cloud_Globe_V2_OpenSource.ino` — application
+- `build_opt.h` — required PNGdec compile option
+- `ui_types.h` — small shared UI types
+- `nasa_blue_marble_565.h` — RGB565 Earth texture
+- `globe_screen_map_512x256.h` — globe projection lookup data
+- `config.ini.example` — SD-card configuration template
 
-| microSD | QtPy ESP32-S2 |
-|---|---|
-| VCC | 3V |
-| GND | GND |
-| SCK / CLK | A2 |
-| MOSI / DI | A3 |
-| MISO / DO | RX |
-| CS | TX |
+## Notes for contributors
 
-The SD bus runs on `HSPI`.
+The code intentionally keeps several internal names prefixed `ISS` rather than adding a generic satellite abstraction. The shipping firmware tracks the ISS only; changing the CelesTrak catalogue number is deliberately a source-level modification.
 
-```cpp
-constexpr int SD_SCK  = A2;
-constexpr int SD_MOSI = A3;
-constexpr int SD_MISO = RX;
-constexpr int SD_CS   = TX;
-```
-
-A conservative 4 MHz SD clock is currently used.
-
----
-
-## Button wiring
-
-Connect a momentary pushbutton between:
-
-```text
-QtPy MI pad → button → GND
-```
-
-The physical pad is labelled **MI**, but in the Arduino ESP32-S2 board definition it is referenced as:
-
-```cpp
-MISO
-```
-
-The firmware uses `INPUT_PULLUP`, so no external resistor is required.
-
----
-
-## Button controls
-
-The button is sampled by its own high-priority FreeRTOS task so Wi-Fi, SD access and PNG decoding do not cause missed clicks.
-
-| Gesture | Action |
-|---|---|
-| 1 click | replay previous 24 hours |
-| 2 clicks | replay previous 7 days |
-| 3 clicks | replay previous 30 days |
-| long press | stop replay / return to live |
-
-The display gives immediate feedback while a click sequence is being entered:
-
-```text
-1x
-2x
-3x
-```
-
-Current timing:
-
-```text
-button polling:         5 ms
-debounce:              25 ms
-between-click window: 1.0 s
-long press:            1.6 s
-```
-
----
-
-## Live time and date
-
-Normal mode shows the current local time and date in JST:
-
-```text
-16:42
-22 AUG
-```
-
-The text is rendered directly over the existing Earth/cloud framebuffer, so no opaque UI panel covers the globe.
-
-During replay, the displayed timestamp becomes the **actual time of the archived cloud image being shown**.
-
-Archive timestamps remain UTC internally.
-
----
-
-# Weather data
-
-## Cloud source
-
-Cloud imagery comes from the:
-
-**China Meteorological Administration / National Satellite Meteorological Center**
-
-Product:
-
-```text
-GEO Satellite Global Image — IR 10.8 µm
-```
-
-WMS layer:
-
-```text
-GEOS_IRX
-```
-
-WMS endpoint:
-
-```text
-https://data.nsmc.org.cn/NSMCAPI/v1/nsmc/image/wms/compose
-```
-
-Typical request:
-
-```text
-?layers=GEOS_IRX
-&datetime=YYYYMMDDHHMM
-&request=GetMap
-&bbox=-180,-90,180,90
-&width=320
-&height=160
-&version=1.1.0
-&format=png
-```
-
----
-
-## Official availability API
-
-The firmware does **not** blindly probe every 15-minute timestamp.
-
-Instead, it asks NSMC which `GEOS_IRX` datasets actually exist.
-
-Availability endpoint:
-
-```text
-https://data.nsmc.org.cn/nsmcapi/v1/nsmc/image/animation/datatime/mongodb
-```
-
-Product code:
-
-```text
-GEO_MULT_GBAL_L2_GGM_IRX_GLL_YYYYMMDD_HHmm_4000M.PNG
-```
-
-Current archive repair window:
-
-```text
-168 hours / 7 days
-```
-
-The returned data currently shows `GEOS_IRX` as an **hourly product**.
-
-That means the firmware no longer wastes requests on `:15`, `:30` or `:45` timestamps that do not contain usable global composites.
-
----
-
-## Cloud processing
-
-The downloaded PNG contains real NSMC infrared imagery.
-
-The display treatment is derived locally:
-
-- source alpha is preserved
-- source luminance is analysed
-- cloud opacity is derived from the image
-- clouds are blended onto the visible Earth texture
-- cloud geography remains aligned with the Blue Marble projection
-
-The current preferred visual tuning is:
-
-```cpp
-constexpr uint16_t CLOUD_OPACITY_GAIN_PERCENT = 350;
-constexpr uint8_t CLOUD_WHITENING = 255;
-```
-
-These values intentionally produce strong white cloud tops while preserving weaker cloud structure through alpha transparency.
-
-This is a **display treatment**, not a calibrated meteorological optical-thickness product.
-
----
-
-# Earth texture
-
-The underlying Earth texture is based on:
-
-**NASA Blue Marble: Next Generation — August 2004**
-
-The image is converted to a 512×256 RGB565 texture and stored in flash.
-
-A precomputed reverse-projection map converts each visible globe pixel to its corresponding latitude/longitude texture coordinate.
-
-Current globe geometry:
-
-```text
-display:          240 × 240
-globe centre:     120,120
-globe radius:     112 px
-view latitude:    +10°
-screen tilt:      0°
-spin direction:   west → east
-spin rate:        15°/second
-```
-
----
-
-# Rendering architecture
-
-The project uses a full 240×240 RGB565 framebuffer:
-
-```text
-240 × 240 × 2 bytes = 115,200 bytes
-```
-
-It is allocated in PSRAM where available.
-
-Each frame is composed completely before being sent to the display:
-
-```text
-Earth
-  ↓
-cloud layer
-  ↓
-globe limb
-  ↓
-time/date/status text
-  ↓
-single full-screen TFT transfer
-```
-
-This avoids visible tearing and overlay flicker.
-
-The resulting animation is significantly smoother than drawing individual globe elements directly to the TFT.
-
----
-
-# Network handling
-
-The QtPy ESP32-S2 can operate at fairly weak Wi-Fi signal levels, but this project was tested with RSSI values around:
-
-```text
--80 to -87 dBm
-```
-
-To prevent long apparent freezes, explicit HTTPS timeouts are used:
-
-```text
-TLS handshake: 12 s
-HTTP connect:  12 s
-HTTP I/O:      20 s
-```
-
-The HTTP response body is read cooperatively in small chunks rather than using a long blocking `writeToStream()` operation.
-
-This allows the single-core ESP32-S2 to continue servicing the globe renderer while network work is happening.
-
----
-
-# SD archive
-
-Accepted cloud PNGs are stored permanently.
-
-Directory structure:
-
-```text
-/clouds/
-  2026/
-    08/
-      23/
-        0000.png
-        0100.png
-        0200.png
-        ...
-```
-
-Filenames and directory timestamps are UTC.
-
-A small archive index is also maintained:
-
-```text
-/clouds/index.csv
-```
-
-No automatic deletion or pruning is currently performed.
-
-A 64 GB SD card is therefore effectively enormous for this project.
-
-At approximately 40 KB per hourly cloud image:
-
-```text
-1 day     ≈   1 MB
-1 week    ≈   7 MB
-1 month   ≈  30 MB
-1 year    ≈ 350 MB
-```
-
-Actual file sizes vary.
-
----
-
-# Automatic gap repair
-
-Every availability refresh:
-
-1. the firmware downloads the official NSMC `GEOS_IRX` timestamp list
-2. it applies the live-image safety cutoff
-3. it compares every listed timestamp with the SD archive
-4. existing PNGs are skipped
-5. missing official frames are added to the repair queue
-6. missing frames are downloaded newest-first
-7. failed downloads remain missing
-8. missing frames are retried during later passes
-
-This is important on weak Wi-Fi because a failed hourly download is not silently forgotten.
-
----
-
-# Live cloud selection
-
-The live display intentionally avoids the very newest possible composite.
-
-A safety delay is applied:
-
-```cpp
-constexpr uint16_t NSMC_SOURCE_LAG_MINUTES = 60;
-```
-
-This reduces the chance of displaying a transient or partially assembled global composite.
-
-If the newest suitable image already exists on SD, it is loaded directly without downloading it again.
-
----
-
-# Replay behaviour
-
-Replay uses archived PNG files from the SD card.
-
-## 24-hour replay
-
-`GEOS_IRX` has been confirmed to be hourly, so 24H playback uses hourly frames:
-
-```text
-maximum frames: 24
-frame interval: 500 ms
-total playback: ≈12 seconds
-```
-
-## 7-day replay
-
-```text
-sampling: hourly
-maximum frames: 168
-```
-
-## 30-day replay
-
-The longer replay mode samples less frequently to keep playback duration practical.
-
----
-
-## Replay startup
-
-A replay request does not immediately freeze the globe.
-
-Instead:
-
-```text
-button gesture
-      ↓
-replay requested
-      ↓
-WAIT
-      ↓
-archive/PNG lock becomes available
-      ↓
-first archived PNG successfully loads
-      ↓
-replay begins
-```
-
-The Earth continues rotating during `WAIT`.
-
-This prevents the display from appearing frozen if SD or archive work is temporarily busy.
-
----
-
-## Resume position after replay
-
-Live rotation is accumulated rather than calculated directly from absolute `millis()`.
-
-That means:
-
-```text
-live globe spinning
-      ↓
-replay starts
-      ↓
-current longitude is frozen
-      ↓
-replay runs
-      ↓
-replay ends / long press
-      ↓
-normal rotation resumes from exactly the same longitude
-```
-
-The globe therefore no longer jumps to a seemingly random position after replay.
-
----
-
-# Boot display
-
-Startup uses a compact ST7789 text log similar in spirit to `u8log`.
-
-It reports stages such as:
-
-```text
-[MEM] OK
-[SD] Ready
-[WIFI] Connected
-[TIME] OK
-[NSMC] Availability in BG
-[ARCHIVE] 7d gap repair
-[BUTTON] Ready
-[READY] Starting globe
-```
-
-After startup, the boot log disappears and the globe takes over the display.
-
----
-
-# Required Arduino libraries
-
-Install:
-
-- **Adafruit GFX Library**
-- **Adafruit ST7735 and ST7789 Library**
-- **PNGdec** by Larry Bank / BitBank Software
-
-The ESP32 Arduino core supplies:
-
-- `WiFi`
-- `WiFiClientSecure`
-- `HTTPClient`
-- `SPI`
-- `SD`
-- FreeRTOS support
-
-The project has been tested with the Arduino ESP32 core in the 3.x series.
-
----
-
-# Wi-Fi configuration
-
-Edit:
-
-```text
-wifi_config.h
-```
-
-Example:
-
-```cpp
-#pragma once
-
-#define WEATHER_WIFI_SSID      "YOUR_WIFI_NAME"
-#define WEATHER_WIFI_PASSWORD  "YOUR_WIFI_PASSWORD"
-```
-
-Do not commit real Wi-Fi credentials to a public repository.
-
----
-
-# Repository files
-
-Typical project structure:
-
-```text
-ESP32_S2_Live_Cloud_Globe/
-├── ESP32_S2_Live_Cloud_Globe.ino
-├── nasa_blue_marble_565.h
-├── globe_screen_map_512x256.h
-├── ui_types.h
-├── wifi_config.h
-├── DATA_PROVENANCE.txt
-└── README.md
-```
-
----
-
-# Notes
-
-### Why ESP32-S2?
-
-The project currently benefits more from the available PSRAM on the chosen QtPy ESP32-S2 than it would from moving to a no-PSRAM ESP32-S3.
-
-Large buffers include:
-
-- 115 KB full-screen RGB565 framebuffer
-- decoded cloud luminance buffer
-- decoded cloud alpha buffer
-- candidate cloud buffers
-- HTTP PNG download buffer
-- PNG decoder working memory
-
-### Why separate SPI for the SD card?
-
-The ST7789 module used here has no chip-select line.
-
-Sharing its SPI bus with another device would therefore cause SD traffic to be interpreted by the display.
-
-The SD card is placed on a second SPI peripheral instead.
-
----
-
-# Status
-
-Current hardware/software baseline:
-
-- live globe rendering working
-- NSMC cloud overlay working
-- SD archive working
-- official availability-driven collection working
-- seven-day gap repair working
-- 24H / 7D / 30D replay working
-- robust pushbutton detection working
-- transparent clock/date overlay working
-- resume-from-replay longitude behaviour working
-
-The project is currently being left running for longer-term archive and reliability testing.
-
----
-
-# Data sources
-
-### NASA
-
-NASA Blue Marble: Next Generation  
-https://visibleearth.nasa.gov/collection/1484/blue-marble
-
-### NSMC
-
-National Satellite Meteorological Center  
-https://www.nsmc.org.cn/
-
-NSMC WMS documentation:  
-https://www.nsmc.org.cn/nsmc/cn/image/wms.html
-
----
-
-## License
-
-The software source code in this repository is licensed under the MIT License.
-See `LICENSE` for details.
-
-Third-party data and imagery are excluded from the MIT license:
-
-- `nasa_blue_marble_565.h` is derived from NASA Blue Marble imagery.
-  NASA should be acknowledged as the source.
-- NSMC/CMA satellite imagery downloaded by the firmware remains subject to
-  the applicable NSMC/CMA data-use terms and is not redistributed or
-  relicensed by this project.
+Large retained buffers are preferentially allocated in PSRAM so internal DRAM remains available for Wi-Fi/mbedTLS. The temporary PNG decoder is created only after HTTP/TLS work has released its memory.
