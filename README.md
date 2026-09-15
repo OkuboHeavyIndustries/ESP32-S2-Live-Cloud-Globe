@@ -2,7 +2,6 @@
 
 A standalone 240 × 240 true-colour Earth display based on an **Adafruit QtPy ESP32-S2**. It renders NASA Blue Marble surface imagery, current CMA/NSMC global IR cloud observations, a real day/night terminator, and a locally propagated ISS orbit. A 128 × 64 OLED provides startup status and ISS pass/visibility information, while a microSD card stores configuration, TLE state and a replayable weather archive.
 
-This folder is intentionally the **clean release source**: historical TLS/backend probes, PNG-corruption forensics, heap diagnostics and other investigation-only code have been removed. Operational error logging remains.
 
 <img src="/cloud_globe.jpg" alt="Cloud Globe" width="500">
 
