@@ -1,3 +1,8 @@
+/*Buy me a coffee!
+Bitcoin: 19H3zFF4W3zUZ3jAdjmiDNNLs8Ja46M6AD
+ETH: 0xD656DB37b61ac30Fa1e16a3162719FE417b231C8
+*/
+
 # Cloud Globe V2
 
 A standalone 240 × 240 true-colour Earth display based on an **Adafruit QtPy ESP32-S2**. It renders NASA Blue Marble surface imagery, current CMA/NSMC global IR cloud observations, a real day/night terminator, and a locally propagated ISS orbit. A 128 × 64 OLED provides startup status and ISS pass/visibility information, while a microSD card stores configuration, TLE state and a replayable weather archive.
